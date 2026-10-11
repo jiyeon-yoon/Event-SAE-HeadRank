@@ -123,10 +123,30 @@ def verify_experiment(experiment):
             raise ValueError("Execution input paths must be absolute")
     if not experiment["sources"] or not Path(experiment["output_root"]).is_absolute():
         raise ValueError("Execution sources/output path are required")
+    # The exception is deliberately archival: it verifies the embedded proof,
+    # not the availability of paths on the machine inspecting old results.
+    has_receipt = "snapshot_receipt" in experiment
+    has_source = "snapshot_receipt" in experiment["sources"]
+    if has_receipt != has_source or has_receipt != ("snapshot_receipt_file_sha256" in experiment):
+        raise ValueError("Snapshot receipt and its execution source binding must appear together")
+    if has_receipt:
+        from .snapshot import verify_snapshot_receipt
+        receipt = experiment["snapshot_receipt"]
+        if (not isinstance(receipt, dict)
+                or receipt.get("runtime_implementation") != experiment["implementation"]
+                or receipt.get("scoring_implementation") != bindings.get("scoring_implementation", experiment["implementation"])):
+            raise ValueError("Snapshot receipt implementation differs from the score/execution bindings")
+        receipt_file_sha256 = _digest(experiment["snapshot_receipt_file_sha256"], "snapshot_receipt_file_sha256")
+        if experiment["sources"]["snapshot_receipt"]["sha256"] != receipt_file_sha256:
+            raise ValueError("Snapshot receipt file binding differs from the frozen source")
+        verify_snapshot_receipt(receipt,
+            score_hash=bindings["score_hash"], scores_sha256=bindings["scores_sha256"],
+            current_identity=experiment["numerical_identity"], sources=experiment["sources"])
 
 
 def build_experiment(plan, *, cfg, numerical_identity, policy, code_identity,
-                     sources, split_evidence, output_root, retry_budget=0):
+                     sources, split_evidence, output_root, retry_budget=0,
+                     snapshot_receipt=None, snapshot_receipt_file_sha256=None):
     """Assemble a contract from already checked inputs; never executes a model."""
     verify_plan(plan)
     if not plan.get("evaluation_cases"):
@@ -147,6 +167,11 @@ def build_experiment(plan, *, cfg, numerical_identity, policy, code_identity,
         "status": "ready_for_explicit_execution",
         "scientific_scope": "prospective_new_feature_panel_on_fixed_tasks_not_confirmatory_task_generalization",
     })
+    if snapshot_receipt is not None:
+        experiment["snapshot_receipt"] = deepcopy(snapshot_receipt)
+        experiment["snapshot_receipt_file_sha256"] = snapshot_receipt_file_sha256
+    elif snapshot_receipt_file_sha256 is not None:
+        raise ValueError("Snapshot receipt file hash requires an embedded receipt")
     experiment["execution_hash"] = fingerprint(experiment)
     verify_experiment(experiment)
     return experiment
@@ -260,7 +285,7 @@ def _run_path(experiment, *, contract_path=None, new=False):
 
 def prepare_execution(config, plan_path, scores_path, registry_path, eval_manifest,
                       reference_result, split_path, output, run_output, *, retry_budget=0,
-                      max_rollouts=None):
+                      max_rollouts=None, snapshot_receipt_path=None):
     """No rollout/model forward. Bind score, split, files, code and current parity."""
     from event_sae.research.output_head.config import load_config
     from event_sae.research.output_head.workflow import numerical_identity, load_parity, _sae_paths, _head_path
@@ -293,8 +318,14 @@ def prepare_execution(config, plan_path, scores_path, registry_path, eval_manife
                            task_ids=plan["task_ids"])
     cfg["rollout"]["eval_manifest"] = str(Path(eval_manifest).resolve())
     identity = numerical_identity(cfg)
-    if scores.get("identity") != identity:
-        raise ValueError("Current runtime identity differs from scoring; revalidate/recompute on the intended device")
+    receipt_file_sha256 = sha256_file(snapshot_receipt_path) if snapshot_receipt_path is not None else None
+    receipt = read_json(snapshot_receipt_path) if snapshot_receipt_path is not None else None
+    if receipt is not None:
+        from .snapshot import verify_snapshot_receipt
+        verify_snapshot_receipt(receipt, score_hash=scores["score_hash"],
+            scores_sha256=sha256_file(scores_path), old_identity=scores.get("identity"), current_identity=identity)
+    elif scores.get("identity") != identity:
+        raise ValueError("Current runtime identity differs from scoring; a valid --snapshot-receipt is required for verified snapshot timestamp-only differences")
     load_parity(cfg, identity)
     policy = effective_policy(cfg)
     weights, sae_config = _sae_paths(cfg)
@@ -317,13 +348,22 @@ def prepare_execution(config, plan_path, scores_path, registry_path, eval_manife
     if not any(p.suffix == ".safetensors" for p in assets):
         raise ValueError("Native snapshot requires local safetensor weights")
     paths.update({"snapshot/" + p.name: p for p in assets})
+    if receipt is not None:
+        paths["snapshot_receipt"] = snapshot_receipt_path
     sources = {name: {"path": str(Path(path).resolve()), "sha256": sha256_file(path)} for name, path in paths.items()}
+    if receipt is not None:
+        if sources["snapshot_receipt"]["sha256"] != receipt_file_sha256:
+            raise ValueError("Snapshot receipt changed during execution preparation")
+        verify_snapshot_receipt(receipt, score_hash=scores["score_hash"],
+            scores_sha256=sha256_file(scores_path), old_identity=scores["identity"], current_identity=identity,
+            sources=sources)
     protected = [str(root), str(weights.parent.resolve()), str(snapshot.resolve()),
                  str(head.resolve()), *scores.get("source_readonly_roots", [])]
     target = safe_output(output, [*paths.values(), *protected, run_output, REPO])
     experiment = build_experiment(plan, cfg=cfg, numerical_identity=identity, policy=policy,
         code_identity=code, sources=sources, split_evidence=split_evidence,
-        output_root=run_output, retry_budget=retry_budget)
+        output_root=run_output, retry_budget=retry_budget, snapshot_receipt=receipt,
+        snapshot_receipt_file_sha256=receipt_file_sha256)
     experiment["protected_roots"] = protected
     experiment["execution_hash"] = fingerprint({k: v for k, v in experiment.items() if k != "execution_hash"})
     _run_path(experiment, contract_path=target, new=True)

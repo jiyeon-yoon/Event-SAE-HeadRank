@@ -61,5 +61,43 @@ def test_completed_journal_cli_verifies_and_analyzes_on_cpu(tmp_path, monkeypatc
 def test_cli_help_describes_connected_commands():
     result = cli("--help")
     assert result.returncode == 0
-    for name in ("cases", "prepare-run", "run", "status", "analyze"):
+    for name in ("cases", "snapshot-check", "prepare-run", "run", "status", "analyze"):
         assert name in result.stdout
+
+
+def _main():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("headrank_cli_under_test", CLI)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.main
+
+
+def test_snapshot_check_dispatch_only_creates_receipt(tmp_path, monkeypatch, capsys):
+    import types
+    calls = []
+    def check(*args):
+        calls.append(args)
+        return {"status": "snapshot_verified_not_runtime_approved", "new_rollouts": 0}
+    monkeypatch.setitem(sys.modules, "event_sae.research.head_rank.snapshot",
+                        types.SimpleNamespace(create_snapshot_receipt=check))
+    result = _main()(["snapshot-check", "--config", "config", "--scores", "scores",
+                      "--reference-result", "reference", "--output", str(tmp_path / "receipt.json")])
+    assert result == 0
+    assert calls == [("config", "scores", "reference", str(tmp_path / "receipt.json"))]
+    assert json.loads(capsys.readouterr().out)["new_rollouts"] == 0
+
+
+def test_prepare_cli_forwards_explicit_receipt_without_executing(monkeypatch, capsys):
+    calls = []
+    def prepare(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"status": "prepared_not_executed", "new_rollouts": 0}
+    monkeypatch.setattr(runtime, "prepare_execution", prepare)
+    args = ["prepare-run"]
+    for name in ("config", "plan", "scores", "registry", "eval-manifest", "reference-result",
+                 "split", "output", "run-output"):
+        args.extend(["--" + name, name])
+    assert _main()([*args, "--snapshot-receipt", "receipt.json"]) == 0
+    assert calls[0][1]["snapshot_receipt_path"] == "receipt.json"
+    assert json.loads(capsys.readouterr().out)["new_rollouts"] == 0

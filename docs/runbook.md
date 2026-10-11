@@ -709,8 +709,39 @@ HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download openvla/openvla-7b \
 ```
 
 GPU·Torch/CUDA 버전 또는 snapshot 파일 metadata가 달라지면 prepare-run이 기존 점수 재사용을
-차단할 수 있다. parity 통과와 score identity 일치는 별개다. 이때 hash나 허용오차를 수정해
-통과시키지 말고 차이를 확인한다. 필요한 경우 점수 재계산 여부를 별도로 결정한다.
+차단할 수 있다. parity 통과와 score identity 일치는 별개다. hash나 파일 시각·허용오차를
+수정해서 통과시키지 않는다.
+
+#### 새 Pod에서 모델 파일의 수정 시각만 달라진 경우
+
+네 safetensors를 다시 다운로드하면 `mtime_ns`는 달라진다. 이 경우에는 전체 score를 다시
+계산하지 않고, 아래 명령으로 **내용을 검증한 별도 snapshot receipt**를 만든다. 다른 identity
+필드의 변화, 파일 추가·삭제, 크기·내용 차이는 허용하지 않는다. exact identity인 경우에도
+같은 명령으로 내용 검증 기록을 만들 수 있다.
+
+```bash
+python "$CLI" snapshot-check \
+  --config "$CFG" \
+  --scores "$SCORES" \
+  --reference-result "$REF" \
+  --output "$RUN/snapshot-receipt.json"
+```
+
+정상 출력은 `status: snapshot_verified_not_runtime_approved`, `new_rollouts: 0`이다.
+`match_mode`는 `mtime_only_relocation` 또는 `current_exact`다. 이 검사는 기존 수치 검증
+결과와 현재 장치 identity를 확인하고 모델 파일을 읽어 SHA256을 계산할 뿐, 모델 forward,
+다운로드, 새 score 계산, 로봇 rollout을 수행하지 않는다. 기존 score/hash/mtime는 그대로다.
+이미 receipt가 있으면 덮어쓰지 않는다.
+
+현재 파일은 고정 HF revision의 네 shard SHA256·크기, 기존 head export의 shard 3/4 해시,
+기록된 processor 파일 해시와 대조한다. 과거 fullscore identity는 전체 shard 1/2의 내용 해시를
+저장하지 않았으므로 `historical_full_model_content_verified: false`를 명시적으로 유지한다.
+현재 파일을 검증했다고 과거 모델 전체 내용까지 소급 증명한 것은 아니다. Head score의 실제
+입력인 고정 cache·출력층·SAE 및 산술 조건은 바뀌지 않아야 한다.
+
+G5에서는 이 receipt를 `--snapshot-receipt`로 명시한다. 준비 단계에서 다시 파일/현재 parity를
+대조하고 execution contract에 receipt와 hash를 포함한다. 실행·재개 때 현재 identity와
+전체 입력 파일 해시를 다시 확인한다. 다른 GPU·버전 차이를 허용하는 우회 옵션이 아니다.
 
 원본 full score SHA-256은
 `aea94626851e0510b50085e4707b534d623867e12b8bf16068274f6d04fb2b4a`다.
@@ -805,16 +836,17 @@ primary와 **3,600회 예산은 그대로**다. 보정 예측은 이 고정 패�
 
 ### G5. 준비, 소규모 control 확인, 재개
 
-코드 변경을 마치고 승인된 clean commit에서 현재 GPU validation을 다시 수행한다.
+승인된 clean commit에서 G2의 현재 GPU validation과 snapshot-check를 마친 뒤 진행한다.
+receipt 생성 후 validation을 다시 실행하면 parity 파일 해시가 바뀔 수 있으므로, 그 경우
+snapshot-check를 새 출력 파일명으로 다시 수행하고 아래 receipt 경로도 바꾼다.
 이 문서는 자동 commit/push나 유료 실행의 승인이 아니다.
 
 ```bash
-python scripts/openvla/output_head_sensitivity.py validate --config "$CFG" --allow-model-execution
-python "$CLI" prepare-run --config "$CFG" --plan "$PLAN" --scores "$SCORES" --registry "$REG" --eval-manifest "$RUN/eval-cases.json" --reference-result "$REF" --split "$SPLIT" --output "$RUN/execution.json" --run-output "$RUN/runs" --max-rollouts 3600
+python "$CLI" prepare-run --config "$CFG" --plan "$PLAN" --scores "$SCORES" --registry "$REG" --eval-manifest "$RUN/eval-cases.json" --reference-result "$REF" --split "$SPLIT" --snapshot-receipt "$RUN/snapshot-receipt.json" --output "$RUN/execution.json" --run-output "$RUN/runs" --max-rollouts 3600
 python "$CLI" run --experiment "$RUN/execution.json"
 ```
 
-여기까지는 validation 외에 로봇 rollout이 없다. 계획 내용/비용을 승인하고 tmux 안에서만 다음을 진행한다:
+위 준비·미리보기 명령은 로봇 rollout을 하지 않는다. 계획 내용/비용을 승인하고 tmux 안에서만 다음을 진행한다:
 
 ```bash
 EXEC_HASH=$(python -c 'import json,sys;print(json.load(open(sys.argv[1]))["execution_hash"])' "$RUN/execution.json")

@@ -48,11 +48,15 @@ def main(argv=None):
     cases.add_argument("--cases-per-task", type=int, default=5)
     cases.add_argument("--seed", type=int, default=1729)
     cases.add_argument("--output", required=True)
+    snapshot_check = commands.add_parser("snapshot-check", help="hash pinned model files and current parity for timestamp-only score reuse; no model execution")
+    for name in ("config", "scores", "reference-result", "output"):
+        snapshot_check.add_argument("--" + name, required=True)
     prepare = commands.add_parser("prepare-run", help="bind predictions/cases/code/current parity; no model forward")
     for name in ("config", "plan", "scores", "registry", "eval-manifest", "reference-result", "split", "output", "run-output"):
         prepare.add_argument("--" + name, required=True)
     prepare.add_argument("--retry-budget", type=int, default=0)
     prepare.add_argument("--max-rollouts", type=int, help="explicit cap including retry reserve, otherwise config cap")
+    prepare.add_argument("--snapshot-receipt", help="optional verified timestamp-only snapshot reuse receipt; never relaxes device/parity checks")
     run = commands.add_parser("run", help="dry preview unless --execute plus exact hash and revision are supplied")
     run.add_argument("--experiment", required=True)
     run.add_argument("--execute", action="store_true")
@@ -113,11 +117,15 @@ def main(argv=None):
         elif args.command == "cases":
             from event_sae.research.head_rank.runtime import select_cases
             result = select_cases(args.split, args.output, cases_per_task=args.cases_per_task, seed=args.seed)
+        elif args.command == "snapshot-check":
+            from event_sae.research.head_rank.snapshot import create_snapshot_receipt
+            result = create_snapshot_receipt(args.config, args.scores, args.reference_result, args.output)
         elif args.command == "prepare-run":
             from event_sae.research.head_rank.runtime import prepare_execution
             result = prepare_execution(args.config, args.plan, args.scores, args.registry, args.eval_manifest,
                 args.reference_result, args.split, args.output, args.run_output,
-                retry_budget=args.retry_budget, max_rollouts=args.max_rollouts)
+                retry_budget=args.retry_budget, max_rollouts=args.max_rollouts,
+                snapshot_receipt_path=args.snapshot_receipt)
         else:
             from event_sae.research.head_rank.runtime import verify_experiment
             from event_sae.research.output_head.provenance import read_json
