@@ -1,0 +1,204 @@
+"""Synthetic protocol tests; no GPU, simulator or behavioral outcomes."""
+
+from copy import deepcopy
+import hashlib
+
+import pytest
+
+from event_sae.research.head_rank.protocol import (
+    KNOWN_EVALUATED_IDS, METRICS, estimate_budget, fingerprint, plan_panel, verify_plan,
+)
+
+
+def scores(count=80):
+    rows = []
+    for fid in list(range(count)) + sorted(KNOWN_EVALUATED_IDS):
+        rows.append({"feature_id": fid, "mean_head_kl": float(fid % 29),
+                     "tail_head_kl": float((fid * 7) % 31),
+                     "direction_excess_kl": float((fid * 11) % 23) - 12,
+                     "event_max": float((fid * 5) % 37)})
+    return {"feature_scores": rows, "status": "scored", "synthetic": False,
+            "sampling_mode": "full", "dictionary_size": 32768}
+
+
+def cases(tasks=(0, 1), count=2):
+    return [{"suite": "libero_spatial", "task_id": task, "task_episode_idx": index,
+             "initial_state_sha256": hashlib.sha256(f"{task}-{index}".encode()).hexdigest(),
+             "seed": 42} for task in tasks for index in range(count)]
+
+
+def test_known_registry_includes_pilot_and_full10_union():
+    assert len(KNOWN_EVALUATED_IDS) == 22
+    assert {5632, 6553, 12409, 17857, 27955, 28491} <= KNOWN_EVALUATED_IDS
+
+
+def test_deterministic_plan_excludes_all_known_and_additional():
+    kwargs = {"additional_evaluated_ids": [1, 4, 7], "reference_bindings": {"code": "frozen"}}
+    first, second = plan_panel(scores(), **kwargs), plan_panel(scores(), **kwargs)
+    assert first == second
+    assert first["status"] == "needs_eval_manifest"
+    assert not first["runtime_approved"] and not first["execute"]
+    assert not (KNOWN_EVALUATED_IDS | {1, 4, 7}).intersection(first["panel_feature_ids"])
+    assert len(first["panel_feature_ids"]) == 8
+    assert len(set(first["panel_feature_ids"])) == 8
+    assert first["eligible_feature_count"] == 77
+    assert len(first["selection"]["trace"]) == 8
+    assert first["selection"]["round_robin_slots"] == 4
+    assert first["selection"]["disagreement_slots"] == first["selection"]["random_slots"] == 2
+    verify_plan(first)
+
+
+def test_row_order_does_not_change_plan_and_input_not_mutated():
+    source = scores()
+    original = deepcopy(source)
+    first = plan_panel(source)
+    source["feature_scores"].reverse()
+    assert plan_panel(source) == first
+    assert source == {**original, "feature_scores": list(reversed(original["feature_scores"]))}
+
+
+def test_seed_changes_random_component():
+    a, b = plan_panel(scores(), seed=1), plan_panel(scores(), seed=2)
+    assert a["panel_feature_ids"][:4] == b["panel_feature_ids"][:4]
+    assert a["selection"] != b["selection"]
+    assert a["plan_hash"] != b["plan_hash"]
+
+
+def test_shared_metric_rankings_deduplicate_and_never_claim_complete_topk_unless_present():
+    source = scores()
+    for row in source["feature_scores"]:
+        for metric in METRICS:
+            row[metric] = -float(row["feature_id"])
+    plan = plan_panel(source, feature_count=2)
+    assert plan["panel_feature_ids"] == [0, 1]
+    for item in plan["top_k_availability"].values():
+        assert item["feature_ids"] == [0, 1, 2]
+        assert item["missing_feature_ids"] == [2]
+        assert not item["complete_top_k_in_panel"]
+        assert not item["substitution_permitted"]
+    verify_plan(plan)
+
+
+def test_no_behavioral_outcome_is_read():
+    source = scores()
+    class Bomb:
+        def __float__(self):
+            raise AssertionError("must not inspect outcomes")
+        def __iter__(self):
+            raise AssertionError("must not inspect outcomes")
+    before = plan_panel(source)
+    source["outcomes"] = Bomb()
+    for row in source["feature_scores"]:
+        row["success_drop"] = Bomb()
+    assert plan_panel(source) == before
+
+
+def test_actual_cases_and_code_binding_are_in_hash():
+    plan = plan_panel(scores(), task_ids=[1, 0], cases_per_task=2,
+                      evaluation_cases=cases(), reference_bindings={"code_revision": "a" * 40})
+    assert plan["status"] == "predictions_frozen_not_runtime_approved"
+    assert plan["budget"]["total_rollouts"] == 40
+    assert plan["evaluation_cases_sha256"] == fingerprint(cases())
+    verify_plan(plan)
+    changed_cases = cases()
+    changed_cases[0]["seed"] += 1
+    other = plan_panel(scores(), task_ids=[0, 1], cases_per_task=2,
+                       evaluation_cases=changed_cases, reference_bindings={"code_revision": "a" * 40})
+    assert other["plan_hash"] != plan["plan_hash"]
+
+
+@pytest.mark.parametrize("key", ["panel_feature_ids", "evaluation_cases", "source_bindings"])
+def test_hash_detects_mutations(key):
+    plan = plan_panel(scores(), task_ids=[0, 1], cases_per_task=2, evaluation_cases=cases())
+    plan[key] = []
+    with pytest.raises(ValueError, match="hash mismatch"):
+        verify_plan(plan)
+
+
+def test_rehashing_illegal_runtime_approval_still_fails():
+    plan = plan_panel(scores())
+    plan["runtime_approved"] = True
+    plan.pop("plan_hash")
+    plan["plan_hash"] = fingerprint(plan)
+    with pytest.raises(ValueError, match="not runtime approval"):
+        verify_plan(plan)
+
+
+def test_rehashing_different_selection_is_detected():
+    plan = plan_panel(scores())
+    plan["panel_feature_ids"].reverse()
+    plan.pop("plan_hash")
+    plan["plan_hash"] = fingerprint(plan)
+    with pytest.raises(ValueError, match="semantic verification"):
+        verify_plan(plan)
+
+
+@pytest.mark.parametrize("features,cases_per_task,rollouts,hours", [
+    (8, 5, 500, 5.677376340022656),
+    (8, 20, 2000, 22.709505360090624),
+    (16, 20, 3600, 40.87710964816312),
+    (24, 20, 5200, 59.04471393623562),
+])
+def test_measured_cost_extrapolation(features, cases_per_task, rollouts, hours):
+    result = estimate_budget(features, cases_per_task=cases_per_task)
+    assert result["total_rollouts"] == rollouts
+    assert result["estimated_condition_hours"] == pytest.approx(hours)
+    assert not result["statistical_power_established"]
+    assert not result["wall_time_guaranteed"]
+    assert not result["execute"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("synthetic", True), ("synthetic", None), ("status", "development_scored"),
+    ("sampling_mode", "smoke"), ("phase", "pilot"), ("complete", False), ("dictionary_size", 10),
+    ("development_only", True), ("feature_set", "development"),
+])
+def test_nonblind_or_incomplete_sources_rejected(key, value):
+    source = scores()
+    source[key] = value
+    with pytest.raises(ValueError):
+        plan_panel(source)
+
+
+@pytest.mark.parametrize("value", [None, True, float("inf"), float("nan"), "1.0"])
+def test_invalid_scores_never_silently_shrink_pool(value):
+    source = scores()
+    source["feature_scores"][0]["direction_excess_kl"] = value
+    with pytest.raises(ValueError, match="must be finite"):
+        plan_panel(source)
+
+
+def test_duplicate_score_ids_and_invalid_additional_ids_rejected():
+    source = scores()
+    source["feature_scores"].append(source["feature_scores"][0])
+    with pytest.raises(ValueError, match="Duplicate"):
+        plan_panel(source)
+    with pytest.raises(ValueError, match="feature_id"):
+        plan_panel(scores(), additional_evaluated_ids=[32768])
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"feature_count": 0}, {"feature_count": True}, {"feature_count": 500},
+    {"top_k": 0}, {"task_ids": []}, {"task_ids": [0, 0]},
+    {"primary_metric": "event_max"}, {"cases_per_task": 0}, {"seed": -1},
+])
+def test_bad_plan_parameters_rejected(kwargs):
+    with pytest.raises(ValueError):
+        plan_panel(scores(), **kwargs)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_index", "duplicate_state", "bad_hash", "extra_task", "missing_case"])
+def test_evaluation_identity_and_task_balance(mutation):
+    items = cases()
+    if mutation == "duplicate_index":
+        items[1]["task_episode_idx"] = 0
+    elif mutation == "duplicate_state":
+        items[1]["initial_state_sha256"] = items[0]["initial_state_sha256"]
+    elif mutation == "bad_hash":
+        items[0]["initial_state_sha256"] = "unverified"
+    elif mutation == "extra_task":
+        items[0]["task_id"] = 9
+    elif mutation == "missing_case":
+        items.pop()
+    with pytest.raises(ValueError):
+        plan_panel(scores(), task_ids=[0, 1], cases_per_task=2, evaluation_cases=items)

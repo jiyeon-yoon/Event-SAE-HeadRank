@@ -31,7 +31,7 @@ class SAEHookError(RuntimeError):
     """Fatal hook error that must abort evaluation instead of counting a failure."""
 
 
-def _load_and_validate_sae(*, model, layer_idx: int, sae_checkpoint_path: str):
+def _load_and_validate_sae(*, model, layer_idx: int, sae_checkpoint_path: str, sae_bundle=None):
     """Load an SAE and prove that it belongs on the requested model layer."""
 
     decoder_layers = model.language_model.model.layers
@@ -39,7 +39,21 @@ def _load_and_validate_sae(*, model, layer_idx: int, sae_checkpoint_path: str):
         raise IndexError(f"layer_idx {layer_idx} out of range [0, {len(decoder_layers)})")
 
     device = str(model.language_model.lm_head.weight.device)
-    sae, sae_config = load_batch_topk_sae(Path(sae_checkpoint_path), device=device)
+    if sae_bundle is None:
+        sae, sae_config = load_batch_topk_sae(Path(sae_checkpoint_path), device=device)
+    else:
+        # The guarded caller owns/binds this preloaded checkpoint to its file
+        # hashes. Reusing it avoids re-reading a large SAE for every case; all
+        # layer/capture/width validation below and hook arithmetic are unchanged.
+        if (not isinstance(sae_bundle, tuple) or len(sae_bundle) != 2
+                or not isinstance(sae_bundle[1], dict)
+                or sae_bundle[1].get("trainer", {}).get("dict_class") != "BatchTopKSAE"):
+            raise ValueError("sae_bundle must contain a loaded BatchTopKSAE and its trainer config")
+        sae, sae_config = sae_bundle
+        if not callable(getattr(sae, "encode", None)) or not callable(getattr(sae, "decode", None)):
+            raise ValueError("Cached SAE must provide encode/decode")
+        if hasattr(sae, "parameters") and any(str(parameter.device) != device for parameter in sae.parameters()):
+            raise ValueError("Cached SAE device differs from the model")
     trainer_cfg = sae_config["trainer"]
     if trainer_cfg.get("submodule_name") != "post_mlp_residual":
         raise ValueError(
@@ -231,11 +245,13 @@ def apply_resid_post_feature_perturb_hook(
     hook_start_step: int,
     run_dir: str,
     log_file,
+    sae_bundle=None,
 ) -> InterventionHookHandle:
     sae, trainer_cfg, decoder_layers = _load_and_validate_sae(
         model=model,
         layer_idx=layer_idx,
         sae_checkpoint_path=sae_checkpoint_path,
+        sae_bundle=sae_bundle,
     )
     activation_dim = int(trainer_cfg["activation_dim"])
     dict_size = int(trainer_cfg["dict_size"])

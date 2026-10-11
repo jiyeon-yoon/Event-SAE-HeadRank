@@ -1,0 +1,6 @@
+{
+  "schema_version": "headrank_additional_known_features_v1",
+  "reviewed_for_team_prior_outcomes": false,
+  "feature_ids": [],
+  "note": "Built-in exclusion already contains the union of 22 pilot/full10 features. Add any OTHER features with outcomes already known by you or teammates. Mark reviewed only after checking; empty is not automatically a claim of no prior knowledge."
+}

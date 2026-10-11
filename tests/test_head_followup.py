@@ -355,9 +355,16 @@ def test_cli_is_safe_without_execute_and_has_no_rollout_command(tmp_path):
     assert process.returncode == 2
 
 
-def test_frozen_runtime_source_not_modified():
-    # Extensions live outside the original numerical fingerprint set.
+def test_headrank_limits_inherited_runtime_changes_to_explicit_adapters():
+    # HeadRank is an independent clone, not the frozen Head checkout. Its only
+    # allowed native extensions are caller-owned runtime/SAE reuse, per-case
+    # seed records and cleanup. The original numerical modules stay frozen.
+    # test_head_rank_native exercises both legacy and cached hook arithmetic.
     baseline = "81487a07509ee10433c41c19d4bbcd079b9a4968"
-    result = subprocess.run(["git", "diff", "--exit-code", baseline, "--", "event_sae/research/output_head",
-                             "event_sae/openvla", "scripts/openvla/output_head_sensitivity.py"], cwd=ROOT, capture_output=True)
+    result = subprocess.run(["git", "diff", "--name-only", baseline, "--", "event_sae/research/output_head",
+                             "event_sae/openvla", "scripts/openvla/output_head_sensitivity.py"],
+                            cwd=ROOT, capture_output=True, text=True)
     assert result.returncode == 0
+    assert set(result.stdout.splitlines()) <= {
+        "event_sae/openvla/eval/runner.py", "event_sae/openvla/intervene.py",
+    }

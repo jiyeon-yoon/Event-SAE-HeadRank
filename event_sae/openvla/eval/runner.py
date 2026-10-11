@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -86,11 +88,58 @@ def eval_libero(
     *,
     trial_indices_by_task: dict[int, list[int]] | None = None,
     expected_initial_states: dict[tuple[int, int], str] | None = None,
+    runtime_bundle: tuple[object, object] | None = None,
+) -> EvalResult:
+    """Evaluate with optional caller-owned model/processor and safe cleanup.
+
+    ``runtime_bundle`` lets a guarded research adapter reuse one loaded policy
+    across isolated single-case attempts. Omitting it retains model loading
+    and policy behavior of the original runner. It does not transfer ownership
+    of the model to this function.
+    """
+    resources = {"files": [], "hooks": [], "envs": []}
+    try:
+        return _eval_libero(
+            cfg, extra_hook_applier, trial_indices_by_task=trial_indices_by_task,
+            expected_initial_states=expected_initial_states, runtime_bundle=runtime_bundle,
+            resources=resources,
+        )
+    finally:
+        propagating_exception = sys.exc_info()[0] is not None
+        errors = []
+        for kind, method in (("hooks", "remove"), ("envs", "close"), ("files", "close")):
+            for resource in reversed(resources[kind]):
+                try:
+                    getattr(resource, method)()
+                except Exception as exc:
+                    errors.append(f"{kind}: {exc!r}")
+        if errors:
+            message = "LIBERO resource cleanup failed: " + "; ".join(errors)
+            if propagating_exception:
+                warnings.warn(message, RuntimeWarning)
+            else:
+                raise RuntimeError(message)
+
+
+def _eval_libero(
+    cfg: RunConfig,
+    extra_hook_applier: Optional[Callable[..., List[object]]] = None,
+    *,
+    trial_indices_by_task: dict[int, list[int]] | None = None,
+    expected_initial_states: dict[tuple[int, int], str] | None = None,
+    runtime_bundle: tuple[object, object] | None = None,
+    resources: dict,
 ) -> EvalResult:
     set_seed_everywhere(cfg.env.seed)
     cfg_unnorm_key = cfg.env.task_suite_name
 
-    model = load_model(cfg)
+    if runtime_bundle is None:
+        model = load_model(cfg)
+        processor = get_processor(cfg) if cfg.model.family == "openvla" else None
+    else:
+        if not isinstance(runtime_bundle, tuple) or len(runtime_bundle) != 2:
+            raise ValueError("runtime_bundle must be a (model, processor) tuple")
+        model, processor = runtime_bundle
     if cfg.model.family == "openvla" and hasattr(model, "norm_stats"):
         if cfg_unnorm_key not in model.norm_stats and f"{cfg_unnorm_key}_no_noops" in model.norm_stats:
             cfg_unnorm_key = f"{cfg_unnorm_key}_no_noops"
@@ -98,12 +147,11 @@ def eval_libero(
             f"Action un-norm key {cfg_unnorm_key} not found in model norm stats."
         )
 
-    processor = get_processor(cfg) if cfg.model.family == "openvla" else None
-
     run_id = get_run_id(cfg.env.task_suite_name, cfg.model.family)
     run_dir = create_run_dir(cfg.logging.root_dir, run_id)
     log_path = open_log_file(run_dir)
     log_file = open(log_path, "w")
+    resources["files"].append(log_file)
     print(f"Logging to local log file: {log_path}")
     log_file.write(f"Logging to local log file: {log_path}\n")
 
@@ -112,20 +160,23 @@ def eval_libero(
     if cfg.logging.save_prompt_records:
         prompt_records_path = os.path.join(run_dir, "prompt_records.jsonl")
         prompt_records_file = open(prompt_records_path, "w", encoding="utf-8")
+        resources["files"].append(prompt_records_file)
 
     trajectory_records_path: str | None = None
     trajectory_records_file = None
     if cfg.logging.save_trajectory_records:
         trajectory_records_path = os.path.join(run_dir, "trajectory_records.jsonl")
         trajectory_records_file = open(trajectory_records_path, "w", encoding="utf-8")
+        resources["files"].append(trajectory_records_file)
 
     # Always write one compact row per rollout. Paired policy conditions can
     # then prove that they used the same exact LIBERO initial state and compare
     # outcomes without parsing human-readable stdout.
     episode_results_path = os.path.join(run_dir, "episode_results.jsonl")
     episode_results_file = open(episode_results_path, "w", encoding="utf-8")
+    resources["files"].append(episode_results_file)
 
-    hooks: List[object] = []
+    hooks: List[object] = resources["hooks"]
     if cfg.sae_collect.enabled:
         layer_idxs = _parse_layer_idxs(cfg.sae_collect.layer_idxs)
         if cfg.sae_collect.mode == "dense":
@@ -202,6 +253,7 @@ def eval_libero(
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = get_libero_env(task, resolution=256)
+        resources["envs"].append(env)
 
         task_episodes, task_successes = 0, 0
         trial_indices = resolve_trial_indices(
@@ -229,6 +281,7 @@ def eval_libero(
 
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
+            episode_seed = cfg.env.seed
             if cfg.env.per_episode_seed:
                 # Condition-independent state RNG: changing feature/condition order
                 # must not change the random stream for an original initial state.
@@ -351,6 +404,8 @@ def eval_libero(
                         "task_id": task_id,
                         "task_episode_idx": episode_idx,
                         "task_description": task_description,
+                        "suite": cfg.env.task_suite_name,
+                        "seed": episode_seed,
                         "initial_state_sha256": initial_state_sha256,
                         "success": bool(done),
                         "num_actions": len(current_episode_actions),
@@ -376,19 +431,12 @@ def eval_libero(
         log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
         log_file.flush()
         append_csv_row(csv_path, task_description, task_success_rate)
+        env.close()
+        resources["envs"].remove(env)
 
     if cfg.logging.save_actions:
         save_actions_json(actions_path, all_actions_by_task)
 
-    for hook in hooks:
-        hook.remove()
-
-    if prompt_records_file is not None:
-        prompt_records_file.close()
-    if trajectory_records_file is not None:
-        trajectory_records_file.close()
-    episode_results_file.close()
-    log_file.close()
     return EvalResult(
         run_dir=run_dir,
         success_rate=float(total_successes) / float(total_episodes),

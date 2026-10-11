@@ -1,0 +1,16 @@
+{
+  "schema_version": "head_rank_origin_v1",
+  "upstream_repository": "https://github.com/jiyeon-yoon/Event-SAE-Head",
+  "upstream_commit": "0a406829f2fd184c081e3c695ab67f373857566c",
+  "upstream_branch": "research/drvla-followup",
+  "local_repository": "Event-SAE-HeadRank",
+  "development_branch": "research/headrank",
+  "default_branch": "main",
+  "git_storage": "independent_clone_no_hardlinks",
+  "remote_publication_at_initial_clone": "not_performed",
+  "publication_repository": "https://github.com/jiyeon-yoon/Event-SAE-HeadRank",
+  "frozen_full10_archive_sha256": "07eeb5c182ee4e195eb526362db9232ae1717de4c94b9b6da2fd62ef288de8bc",
+  "frozen_full10_hf_revision": "69c33d6a943c253dc97cf9a3968095276f7e9540",
+  "sae_sha256": "18443083d320d2ad3c607431f307697639966ad92075bdfe031398557f3ba9d6",
+  "new_rollouts": 0
+}
