@@ -14,7 +14,8 @@ import re
 from event_sae.research.output_head.provenance import (
     assert_safe_output, atomic_write_json, fingerprint, git_identity, read_json, sha256_file,
 )
-from .protocol import plan_panel, verify_plan
+from .protocol import plan_panel, verify_plan, selection_options
+from .compatibility import validate_scoring_implementation, verify_scoring_bindings
 from .workflow import REPO, implementation_identity, safe_output, validate_full_score_population
 
 ANALYSIS = {"bootstrap_replicates": 2000, "bootstrap_seed": 1729, "confidence_level": .95}
@@ -98,6 +99,10 @@ def verify_experiment(experiment):
     bindings = plan["source_bindings"]
     if bindings.get("implementation") != experiment.get("implementation"):
         raise ValueError("Prediction and execution implementations differ")
+    verify_scoring_bindings(bindings, experiment["implementation"])
+    if "calibrated_predictions" in bindings:
+        from ..head_predict.evaluation import validate_prediction_attachment
+        validate_prediction_attachment(plan)
     if experiment.get("policy_config_hash") != fingerprint(experiment["effective_policy"]):
         raise ValueError("Native policy hash mismatch")
     if experiment.get("analysis") != ANALYSIS:
@@ -180,10 +185,20 @@ def _check_score_plan(plan, scores, evaluation, registry):
         raise ValueError("Only complete all-active discovery scores can authorize a new panel")
     if registry.get("reviewed_for_team_prior_outcomes") is not True:
         raise ValueError("Team known-feature registry has not been reviewed")
-    if scores["implementation"] != implementation_identity():
-        raise ValueError("Implementation changed after scoring")
+    current_implementation = implementation_identity()
+    compatibility = validate_scoring_implementation(scores["implementation"], current_implementation)
     bindings = plan["source_bindings"]
-    if (bindings.get("implementation") != scores["implementation"]
+    verify_scoring_bindings(bindings, current_implementation)
+    if "calibrated_predictions" in bindings:
+        from ..head_predict.evaluation import validate_prediction_attachment
+        validate_prediction_attachment(plan)
+    if "scoring_implementation" in bindings:
+        if (bindings["scoring_implementation"] != scores["implementation"]
+                or bindings.get("scorer_compatibility") != compatibility):
+            raise ValueError("Frozen immutable scorer provenance differs from the scores")
+    elif scores["implementation"] != current_implementation:
+        raise ValueError("Legacy score reuse requires explicit separate scoring/runtime bindings")
+    if (bindings.get("implementation") != current_implementation
             or bindings.get("score_hash") != scores["score_hash"]
             or bindings.get("score_scope") != scores["scope"]
             or bindings.get("event_max_binding") != scores["event_max_binding"]
@@ -192,7 +207,7 @@ def _check_score_plan(plan, scores, evaluation, registry):
     replay = plan_panel(scores, additional_evaluated_ids=registry["feature_ids"],
         feature_count=len(plan["panel_feature_ids"]), seed=plan["selection"]["seed"], top_k=plan["top_k"],
         task_ids=plan["task_ids"], cases_per_task=plan["cases_per_task"], primary_metric=plan["primary_metric"],
-        reference_bindings=bindings, evaluation_cases=evaluation["cases"])
+        reference_bindings=bindings, evaluation_cases=evaluation["cases"], **selection_options(plan))
     if replay != plan:
         raise ValueError("Predictions do not replay exactly from complete frozen scores and cases")
 
@@ -312,7 +327,7 @@ def prepare_execution(config, plan_path, scores_path, registry_path, eval_manife
     experiment["protected_roots"] = protected
     experiment["execution_hash"] = fingerprint({k: v for k, v in experiment.items() if k != "execution_hash"})
     _run_path(experiment, contract_path=target, new=True)
-    if git_identity(REPO) != code or implementation_identity() != scores["implementation"]:
+    if git_identity(REPO) != code or implementation_identity() != plan["source_bindings"]["implementation"]:
         raise ValueError("Source changed during preparation")
     atomic_write_json(target, experiment)
     return {"status": "prepared_not_executed", "experiment": str(target),

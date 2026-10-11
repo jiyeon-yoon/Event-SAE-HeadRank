@@ -30,8 +30,15 @@ def main(argv=None):
     plan.add_argument("--scores", required=True)
     plan.add_argument("--registry", required=True)
     plan.add_argument("--eval-manifest")
-    plan.add_argument("--features", type=int, default=8)
-    plan.add_argument("--cases-per-task", type=int, default=5)
+    plan.add_argument("--features", type=int)
+    plan.add_argument("--cases-per-task", type=int)
+    plan.add_argument("--preset", choices=("full10",),
+                      help="16 feature conditions + raw/identity, 10 tasks x 20 cases = 3600 rollouts")
+    plan.add_argument("--selection-strategy", choices=("round_robin", "topk_union"))
+    plan.add_argument("--include-excess-topk", action="store_true",
+                      help="also guarantee Excess top-K coverage (secondary, not the default primary claim)")
+    plan.add_argument("--seed", type=int, default=1729)
+    plan.add_argument("--top-k", type=int, default=3)
     plan.add_argument("--primary-metric", choices=("tail_head_kl", "direction_excess_kl"), default="tail_head_kl")
     plan.add_argument("--output", required=True)
     verify = commands.add_parser("verify-plan", help="check frozen predictions, not GPU/runtime parity")
@@ -77,9 +84,25 @@ def main(argv=None):
                     progress=lambda p: print(json.dumps(p), file=sys.stderr, flush=True))
         elif args.command == "plan":
             from event_sae.research.head_rank.workflow import plan_workflow
+            if args.preset == "full10":
+                for name, wanted in (("features", 16), ("cases_per_task", 20),
+                                     ("selection_strategy", "topk_union")):
+                    if getattr(args, name) not in (None, wanted):
+                        raise ValueError(f"--preset full10 requires {name}={wanted}")
+                    setattr(args, name, wanted)
+                from event_sae.research.output_head.provenance import read_json
+                scope = read_json(args.scores).get("scope", {})
+                if sorted(scope.get("task_ids", [])) != list(range(10)):
+                    raise ValueError("--preset full10 requires exactly task IDs 0..9")
+            else:
+                args.features = 8 if args.features is None else args.features
+                args.cases_per_task = 5 if args.cases_per_task is None else args.cases_per_task
+                args.selection_strategy = args.selection_strategy or "round_robin"
             result = plan_workflow(args.scores, args.output, registry=args.registry,
                 eval_manifest=args.eval_manifest, feature_count=args.features,
-                cases_per_task=args.cases_per_task, primary_metric=args.primary_metric)
+                cases_per_task=args.cases_per_task, primary_metric=args.primary_metric,
+                selection_strategy=args.selection_strategy, include_excess_topk=args.include_excess_topk,
+                seed=args.seed, top_k=args.top_k, require_full10=args.preset == "full10")
         elif args.command == "verify-plan":
             from event_sae.research.head_rank.protocol import verify_plan
             from event_sae.research.output_head.provenance import read_json

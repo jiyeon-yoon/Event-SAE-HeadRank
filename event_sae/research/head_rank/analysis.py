@@ -269,6 +269,9 @@ def analyze_results(experiment: Mapping[str, Any], completed: Mapping[str, Any],
             "Failure to exclude zero is not equivalence; pilot outcomes used to change a method require new features for confirmation",
         ],
     }
+    if "calibrated_predictions" in plan.get("source_bindings", {}):
+        from event_sae.research.head_predict.evaluation import evaluate_prediction_attachment
+        result["calibrated_prediction_comparison"] = evaluate_prediction_attachment(plan, effects)
     result["analysis_hash"] = fingerprint(result)
     return result
 
@@ -315,6 +318,17 @@ def render_report(result):
         lines.append(f"| {rank['first']} − {rank['second']} | {_display(rank['difference'])} | "
                      f"[{_display(a['low'])}, {_display(a['high'])}] | {_display(top['difference'])} | "
                      f"[{_display(b['low'])}, {_display(b['high'])}] |")
+    prediction = result.get("calibrated_prediction_comparison")
+    if prediction is not None:
+        lines += ["", "## Frozen calibrated predictor (secondary)", "",
+                  f"Predictor: `{prediction['predictor']}`. Predictions were bound into the plan before execution.",
+                  f"Mean absolute signed-drop error: {_display(prediction['mae'])}; "
+                  f"panel Spearman: {_display(prediction['spearman'])}.",
+                  "This is a secondary prediction test on the Tail-selected panel, not a dictionary-wide accuracy claim.", "",
+                  "| Feature | Predicted drop | Observed drop | Error |", "| --- | ---: | ---: | ---: |"]
+        lines += [f"| {row['feature_id']} | {_display(row['predicted_drop'])} | "
+                  f"{_display(row['observed_drop'])} | {_display(row['error'])} |"
+                  for row in prediction["predictions"]]
     lines += ["", "## Scope and limitations", ""]
     lines += [f"- {item}" for item in result["scope"]]
     return "\n".join(lines) + "\n"
@@ -333,6 +347,7 @@ def analyze_experiment(experiment_path, run_root, output, bootstrap_replicates=2
         "head_rank/execution.py": module_root / "execution.py",
         "head_rank/runtime.py": module_root / "runtime.py",
         "output_head/results.py": module_root.parent / "output_head/results.py",
+        "head_predict/evaluation.py": module_root.parent / "head_predict/evaluation.py",
     }
     implementation = {name: sha256_file(path) for name, path in implementation_paths.items()}
     experiment = read_json(experiment_path)

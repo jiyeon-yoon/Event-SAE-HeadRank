@@ -1,12 +1,37 @@
 # Event-SAE HeadRank
 
 기존 실험을 보존하면서 **출력층 민감도로 아직 행동 평가하지 않은 SAE feature의
-중요도 순위**를 예측하는 후속 개발 저장소다. 성공률 하락 %p를 보정해 예측하는 모델은 아니다.
+중요도 순위**를 예측하는 후속 개발 저장소다. `headrank.py`는 비학습 순위 실험이고,
+`headpredict.py`는 별도의 **개발용 성공률 하락 보정 예측기**다. 두 결과를 혼동하지 않는다.
 
 **현재 구현: 오프라인 점수 계산 → 예측/평가 계획 고정 → native 행동 평가 연결 →
-개입 검증·중단/재개 → paired 결과 분석. 미실행: 실제 GPU에서 새 점수 계산과
-새 feature 행동 평가. CPU/mock 테스트는 실제 로봇·GPU 검증이 아니다. 예측 개선이나
+개입 검증·중단/재개 → paired 결과 분석. 기존 v1 전체 점수 계산은 완료했지만
+새 feature 행동 평가와 이번 추가 코드의 GPU 검증은 미완료다. CPU/mock 테스트는 실제 로봇·GPU 검증이 아니다. 예측 개선이나
 논문 기여가 입증된 상태는 아니다.**
+
+## 현재 실행 경로 — 기존 Full10과 같은 규모
+
+개발 브랜치: `research/calibrated-head-tail`. 원래 `main`의 `183eaa9`와 이미 계산한
+점수/행동 결과는 보존한다. 이 변경은 자동 commit/push 또는 GPU 실행을 하지 않는다.
+
+- **점수 대상:** 저장된 6,009 active feature. v1 `full-scores.json`을 검증 후 재사용한다.
+- **행동 평가 대상:** 미평가 feature **16개** + raw/identity **2조건**.
+- **평가량:** 10 task × 20 초기상태 × 18조건 = **3,600 rollout**, 재시도 예산은 별도.
+- **후보 선정:** eligible Tail/Mean/Event-max의 원래 Top-3 합집합을 보장하고,
+  남는 자리는 사전 고정한 순위 불일치/무작위 규칙으로 채운다. 기존에 이미 평가한
+  22개와 팀원에게 결과를 들은 feature는 제외한다. 따라서 전 사전의 Top-3가 아니라
+  **미평가 후보 집합의 Top-3** 비교다. Direction-excess는 기본적으로 보조 비교군이다.
+- **비용:** 기존 RTX4090 condition-time 단순 환산 약40.9시간. 실행 시간/성능/검정력 보장이 아니다.
+- **중요한 한계:** 기존 자료에서 Tail과 Mean의 순위가 거의 같았다. 이 구현은 완주와
+  공정한 비교를 지원하는 것이며, Tail 우월성이 이미 확인됐다는 뜻이 아니다.
+
+전체 명령은 [실행 안내 G: Tail Full10 + 보정 예측기](docs/runbook.md#g-tail-full10--보정-예측기)를 따른다.
+아래 기존 8개/500회 예시는 작은 검증용이다. `plan --preset full10`은 16개/3,600회용이다.
+
+재설계한 예측기는 먼저 기존 16개 행동 결과로 feature-held-out 개발 검증을 한다.
+출력 변화 **크기**, 선택 변경률, 작업별/7생성위치별 **행동-bin 분포 반응**을 사용하며,
+Event/크기 기반 모델도 같은 라벨과 회귀 규칙으로 보정해 비교한다. 최종 model을 학습했다고
+바로 새 rollout이 승인되지 않는다. 예측기 개발과 Tail의 고정된 행동 평가 경로는 분리되어 있다.
 
 ## 기존 실험 보존
 
@@ -68,9 +93,13 @@ PYTHONPATH=. python -m pytest -q tests/test_head_rank_*.py
 통과하지 않았다. 기존 Dr.VLA의 scikit-learn 보정 테스트1개는 이 macOS 환경에서
 native process가 종료되어 회귀 검사에서 제외했다.
 
-현재 HeadRank CPU 테스트212개 통과. 관련 기존 회귀 검사를 포함하면574개 통과,
-위1개 제외다. 샌드박스 내 OpenMP 공유메모리 오류가 난 회귀 검사는 권한 승인 후
-밖에서 재실행해 통과했다. 원래 `Event-SAE-Head`의 Git 상태는 변경 없이 깨끗하다.
+검사 명령과 결과는 실행 시점의 소스에 대해 기록한다. 현재 HeadRank/HeadPredict 및
+관련 기존 회귀 검사 명령은 다음과 같다. 위 Dr.VLA 환경 문제 1개는 명시적으로 제외한다.
+원래 `Event-SAE-Head`의 Git 상태는 변경 없이 깨끗하다.
+
+```bash
+python -m pytest -q tests/test_head_rank*.py tests/test_head_predict*.py tests/test_output_head*.py tests/test_head_stage1.py tests/test_head_followup.py -k 'not test_generality_calibration_requires_independent_labels_and_refits_folds'
+```
 
 이후 명령은 **이전 입력을 이미 복원한 RunPod 경로 예시**다. Pod에서 새 저장소를
 별도 디렉터리에 복제하고 그 디렉터리에서 실행한다. 기존 저장소에 변경을 덮어쓰지 않는다.
@@ -194,8 +223,10 @@ hash는 예측·선정 규칙·case·구현을 연결하지만 사람이 결과�
 모델 가중치 전체 content hash도 읽으므로 모델 크기만큼 디스크 I/O 시간이 든다.
 **코드를 검토한 뒤 clean commit으로 고정해야 준비/유료 실행이 가능하다.
 실험 CLI는 자동 commit, 다운로드, 승인 없는 유료 실행을 하지 않는다.**
-코드를 고정한 버전에서 parity와 점수를 생성해야 하며, 이후 구현이 바뀌면 이전 점수를
-새 코드 결과인 것처럼 승인할 수 없다.
+코드를 고정한 버전에서 parity와 점수를 연결한다. 지원되는 예외는 출처를 정확히 고정한
+`183eaa9` v1 점수의 검증된 재사용뿐이다. 원래 scorer/수치 의존성과 새 planner/runtime
+출처를 별도로 보존하며, 원래 점수의 hash나 implementation을 고쳐 재서명하지 않는다.
+임의로 변경된 scorer/환경/입력은 그대로 차단한다.
 
 ```bash
 python scripts/openvla/headrank.py prepare-run \
@@ -282,12 +313,12 @@ python scripts/openvla/headrank.py analyze \
 
 ## 남은 실제 검증과 연구 판단
 
-1. GPU smoke로 실제 수치 타당성·norm 매칭·시간을 확인하고 전체 계산 여부를 결정한다.
-2. 점수와 규칙을 고정한 후 새 feature 후보와 paired case를 확정한다.
+1. v1 GPU 점수 계산은 이미 완료했다. 이번 추가 descriptor 경로를 사용할 때만 그 경로의 실제 GPU 검증이 필요하다.
+2. 팀원의 기존 평가 ID를 확인한 뒤 규칙·새 feature 후보·paired case를 확정한다.
 3. 구현한 native 실행기의 실제 GPU control pair smoke와 모든 control 검증을 수행한다.
 4. 새 feature를 각각 제거하고, 실제 hook 증거와 paired 성공률 하락을 확인한다.
-5. 완료 결과를 CPU 분석한다. 새 두 점수 중 주 지표를 사전 선택하고 다른 하나는
-   탐색적으로 보고하거나 별도로 사전 정의한 다중비교 보정을 적용한다.
+5. 완료 결과를 CPU 분석한다. Full10 preset의 주 지표는 Tail이며 Excess/보정 예측은
+   보조 분석이다. 분석 후 잘 나온 방법으로 주 지표를 바꾸지 않는다.
 
 새 feature에서 Mean Head-KL과 Event-max보다 실제 예측이 개선되어야 후속 기여를 주장할 수 있다.
 출력 변화가 크다는 것만으로 유해성·의미 있는 행동 개념·실패를 입증하지 않는다.

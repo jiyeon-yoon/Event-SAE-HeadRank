@@ -24,6 +24,7 @@ def implementation_identity():
     files = sorted(Path(__file__).parent.glob("*.py")) + [
         REPO / "scripts/openvla/headrank.py",
         REPO / "event_sae/research/head_followup/interventions.py",
+        REPO / "event_sae/research/head_predict/evaluation.py",
     ]
     return {"base_implementation_hash": implementation_fingerprint(),
             "files": {str(p.relative_to(REPO)): sha256_file(p) for p in files}}
@@ -200,9 +201,12 @@ def score_workflow(config, reference_result, event_scores, output, *, full_reado
 
 
 def plan_workflow(scores_path, output, *, registry, eval_manifest=None, feature_count=8,
-                  cases_per_task=5, primary_metric="tail_head_kl"):
+                  cases_per_task=5, primary_metric="tail_head_kl", seed=1729, top_k=3,
+                  selection_strategy="round_robin", include_excess_topk=False,
+                  require_full10=False):
     """Freeze predictions without reading any raw/edited success labels."""
     from .protocol import plan_panel
+    from .compatibility import validate_scoring_implementation
     scores = read_json(scores_path)
     saved_hash = scores.get("score_hash")
     if saved_hash != fingerprint({k: v for k, v in scores.items() if k != "score_hash"}):
@@ -210,8 +214,13 @@ def plan_workflow(scores_path, output, *, registry, eval_manifest=None, feature_
     if scores.get("development_only") is not False or scores.get("feature_set") != "all-active":
         raise ValueError("Blind selection requires full all-active scores, not development/smoke")
     validate_full_score_population(scores)
-    if scores.get("implementation") != implementation_identity():
-        raise ValueError("Source changed after scoring; inspect differences before freezing a new plan")
+    current_implementation = implementation_identity()
+    compatibility = validate_scoring_implementation(scores.get("implementation"), current_implementation)
+    if require_full10 and (scores["scope"]["task_ids"] != list(range(10))
+                           or feature_count != 16 or cases_per_task != 20
+                           or selection_strategy != "topk_union" or top_k != 3
+                           or primary_metric != "tail_head_kl"):
+        raise ValueError("Full10 requires Tail primary, topk_union, 16 features, original top-3, tasks 0..9 and 20 cases/task")
     known = read_json(registry)
     if known.get("reviewed_for_team_prior_outcomes") is not True:
         raise ValueError("Confirm the additional known-feature registry with your team first")
@@ -223,13 +232,18 @@ def plan_workflow(scores_path, output, *, registry, eval_manifest=None, feature_
     evaluation = read_json(eval_manifest) if eval_manifest else None
     cases = evaluation.get("cases") if evaluation else None
     bindings = {"scores_sha256": sha256_file(scores_path), "score_hash": saved_hash,
-                "registry_sha256": sha256_file(registry), "implementation": implementation_identity(),
+                "registry_sha256": sha256_file(registry), "implementation": current_implementation,
+                "scoring_implementation": scores["implementation"], "scorer_compatibility": compatibility,
                 "event_max_binding": scores["event_max_binding"], "score_scope": scores["scope"],
                 "eval_manifest_sha256": sha256_file(eval_manifest) if eval_manifest else None,
                 "evaluation_label_history": evaluation.get("evaluation_labels_previously_used") if evaluation else None}
     plan = plan_panel(scores, additional_evaluated_ids=additional, feature_count=feature_count,
         cases_per_task=cases_per_task, task_ids=scores["scope"]["task_ids"],
-        primary_metric=primary_metric, reference_bindings=bindings, evaluation_cases=cases)
+        primary_metric=primary_metric, reference_bindings=bindings, evaluation_cases=cases,
+        seed=seed, top_k=top_k, selection_strategy=selection_strategy,
+        include_excess_topk=include_excess_topk)
+    if implementation_identity() != current_implementation:
+        raise ValueError("Source changed during planning; do not publish a mixed-code plan")
     atomic_write_json(target, plan)
     return {"status": plan["status"], "output": str(target), "plan_hash": plan["plan_hash"],
             "new_rollouts": 0, "rollout_execution": "requires_prepare_run_and_explicit_execution_approval"}

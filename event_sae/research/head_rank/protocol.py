@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA_VERSION = "head_rank_blind_panel_v1"
+TOPK_UNION_SCHEMA_VERSION = "head_rank_blind_panel_v2"
 DICTIONARY_SIZE = 32768
 METRICS = ("mean_head_kl", "tail_head_kl", "direction_excess_kl", "event_max")
 HISTORICAL_CONDITION_HOURS = 40.87710964816312
@@ -170,7 +171,8 @@ def plan_panel(scores: Mapping[str, Any], *, additional_evaluated_ids=(),
                feature_count: int = 8, seed: int = 1729, top_k: int = 3,
                cases_per_task: int = 5, task_ids=range(10),
                primary_metric: str = "tail_head_kl", reference_bindings=None,
-               evaluation_cases=None) -> dict[str, Any]:
+               evaluation_cases=None, selection_strategy="round_robin",
+               include_excess_topk=False) -> dict[str, Any]:
     """Freeze outcome-blind rankings and a budgeted, multi-method feature panel.
 
     No behavior labels are accepted or used.  This predicts importance ordering,
@@ -181,6 +183,12 @@ def plan_panel(scores: Mapping[str, Any], *, additional_evaluated_ids=(),
     seed = _integer(seed, "seed")
     top_k = _integer(top_k, "top_k", minimum=1)
     cases_per_task = _integer(cases_per_task, "cases_per_task", minimum=1)
+    if selection_strategy not in ("round_robin", "topk_union"):
+        raise ValueError("selection_strategy must be round_robin or topk_union")
+    if type(include_excess_topk) is not bool:
+        raise ValueError("include_excess_topk must be a boolean")
+    if selection_strategy == "round_robin" and include_excess_topk:
+        raise ValueError("include_excess_topk is available only for topk_union")
     tasks = [_integer(task, "task_id") for task in task_ids]
     if not tasks or len(set(tasks)) != len(tasks):
         raise ValueError("task_ids must be nonempty and unique")
@@ -207,22 +215,39 @@ def plan_panel(scores: Mapping[str, Any], *, additional_evaluated_ids=(),
     round_robin_count = feature_count - 2 * reserved
     panel, trace = [], []
     selected = set()
-    # Every scorer gets its turn; duplicates consume no slot and no method is
-    # backfilled using observed successes or another downstream outcome.
-    for metric in itertools.cycle(priority):
-        fid = next(fid for fid in ranks[metric] if fid not in selected)
-        selected.add(fid)
-        panel.append(fid)
-        trace.append({"feature_id": fid, "source": "rank_round_robin", "metric": metric})
-        if len(panel) == round_robin_count:
-            break
+    if selection_strategy == "round_robin":
+        # Preserve v1 exactly, including its historical partial-top-k coverage.
+        for metric in itertools.cycle(priority):
+            fid = next(fid for fid in ranks[metric] if fid not in selected)
+            selected.add(fid)
+            panel.append(fid)
+            trace.append({"feature_id": fid, "source": "rank_round_robin", "metric": metric})
+            if len(panel) == round_robin_count:
+                break
+        disagreement_slots = random_slots = reserved
+    else:
+        guaranteed_metrics = ["tail_head_kl", "mean_head_kl", "event_max"]
+        if include_excess_topk:
+            guaranteed_metrics.append("direction_excess_kl")
+        for metric in guaranteed_metrics:
+            for rank, fid in enumerate(ranks[metric][:top_k], 1):
+                if fid not in selected:
+                    selected.add(fid)
+                    panel.append(fid)
+                    trace.append({"feature_id": fid, "source": "original_top_k_union",
+                                  "metric": metric, "original_eligible_rank": rank})
+        union_slots = len(panel)
+        if union_slots > feature_count:
+            raise ValueError("feature_count cannot hold the original eligible top-k union; no substitution permitted")
+        remainder = feature_count - union_slots
+        disagreement_slots, random_slots = (remainder + 1) // 2, remainder // 2
     rng = random.Random(seed)
     tie_order = sorted(row["feature_id"] for row in eligible if row["feature_id"] not in selected)
     rng.shuffle(tie_order)
     tiebreak = {fid: index for index, fid in enumerate(tie_order)}
     spread = {fid: max(positions[metric][fid] for metric in METRICS)
                    - min(positions[metric][fid] for metric in METRICS) for fid in tie_order}
-    disagreements = sorted(tie_order, key=lambda fid: (-spread[fid], tiebreak[fid]))[:reserved]
+    disagreements = sorted(tie_order, key=lambda fid: (-spread[fid], tiebreak[fid]))[:disagreement_slots]
     for fid in disagreements:
         selected.add(fid)
         panel.append(fid)
@@ -230,7 +255,7 @@ def plan_panel(scores: Mapping[str, Any], *, additional_evaluated_ids=(),
                       "max_minus_min_rank": spread[fid]})
     random_pool = sorted(row["feature_id"] for row in eligible if row["feature_id"] not in selected)
     rng.shuffle(random_pool)
-    for fid in random_pool[:reserved]:
+    for fid in random_pool[:random_slots]:
         selected.add(fid)
         panel.append(fid)
         trace.append({"feature_id": fid, "source": "seeded_random_remainder"})
@@ -247,7 +272,7 @@ def plan_panel(scores: Mapping[str, Any], *, additional_evaluated_ids=(),
             "substitution_permitted": False,
         }
     plan = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if selection_strategy == "round_robin" else TOPK_UNION_SCHEMA_VERSION,
         "status": "needs_eval_manifest" if cases is None else "predictions_frozen_not_runtime_approved",
         "synthetic": False, "execute": False, "runtime_approved": False,
         "prediction_target": "rank_of_signed_raw_minus_ablation_success_rate_drop",
@@ -298,13 +323,22 @@ def plan_panel(scores: Mapping[str, Any], *, additional_evaluated_ids=(),
             "Runtime execution requires separate implementation, safety validation and approval",
         ],
     }
+    if selection_strategy == "topk_union":
+        plan["selection"].update(
+            version="original_topk_union_disagreement_random_v2",
+            strategy="topk_union", include_excess_topk=include_excess_topk,
+            guaranteed_top_k_metrics=guaranteed_metrics, metric_priority=guaranteed_metrics,
+            union_slots=union_slots,
+            round_robin_slots=0, disagreement_slots=disagreement_slots, random_slots=random_slots,
+        )
+        plan["analysis_rules"]["feature_novelty_scope"] = "unseen_feature_outcomes_not_unseen_tasks"
     plan["plan_hash"] = fingerprint(plan)
     return plan
 
 
 def verify_plan(plan: Mapping[str, Any]) -> None:
     """Validate both the content hash and deterministic planning semantics."""
-    if not isinstance(plan, Mapping) or plan.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(plan, Mapping) or plan.get("schema_version") not in (SCHEMA_VERSION, TOPK_UNION_SCHEMA_VERSION):
         raise ValueError("Unsupported blind panel schema")
     payload = deepcopy(dict(plan))
     expected = payload.pop("plan_hash", None)
@@ -336,9 +370,20 @@ def verify_plan(plan: Mapping[str, Any]) -> None:
         cases_per_task=plan["cases_per_task"], task_ids=plan["task_ids"],
         primary_metric=plan["primary_metric"], reference_bindings=plan["source_bindings"],
         evaluation_cases=plan["evaluation_cases"],
+        **selection_options(plan),
     )
-    for key in ("status", "panel_feature_ids", "panel_rankings", "top_k_availability",
+    for key in ("schema_version", "status", "panel_feature_ids", "panel_rankings", "top_k_availability",
                 "selection", "budget", "evaluation_cases_sha256", "analysis_rules",
                 "eligible_feature_count", "eligible_feature_scores"):
         if replay[key] != plan.get(key):
             raise ValueError(f"Plan semantic verification failed: {key}")
+
+
+def selection_options(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Explicit schema dispatch keeps old v1 plans on their original algorithm."""
+    if plan.get("schema_version") == SCHEMA_VERSION:
+        return {}
+    if plan.get("schema_version") == TOPK_UNION_SCHEMA_VERSION:
+        return {"selection_strategy": "topk_union",
+                "include_excess_topk": plan["selection"].get("include_excess_topk", False)}
+    raise ValueError("Unsupported blind panel schema")

@@ -1,5 +1,8 @@
 # 출력층 민감도: 실행·복구 안내
 
+현재 HeadRank 후속 개발은 **G. Tail Full10 + 보정 예측기**를 참고한다.
+A~F는 기존 실험의 복구/실행 기록이며 기존 3,600회를 다시 실행하라는 지시가 아니다.
+
 연구 내용·결과·데이터별 역할은 [experiment.md](experiment.md)를 참고한다.
 **이미 완료된 결과만 확인하려면 A만 실행한다. GPU Pod을 새로 만들 필요가 없다.**
 Dr.VLA 후속 비교는 아래 D의 별도 규칙이다. 기존 B의 3,600회 실행을 다시 시작할 필요는 없다.
@@ -575,10 +578,263 @@ python -m pytest -q
 git diff --check
 ```
 
-`origin`은 Head여야 한다. Baseline/다른 팀원 저장소에는 push하지 않는다.
+현재 `origin`은 `jiyeon-yoon/Event-SAE-HeadRank`여야 한다. Head/Baseline/다른 팀원 저장소에는 push하지 않는다.
 공용 설정 YAML의 입력은 비어 있으므로 `audit`이 경로 누락으로 blocked인 것은 정상이다.
 GPU 결과 확인과 로컬 단위 테스트는 구분한다. macOS sandbox에서 OpenMP 공유 메모리 오류가
 나면 환경 제약을 확인하며, 테스트 실패를 숨기거나 실험 수치를 바꾸지 않는다.
 
 세부 CLI schema·과거 시행착오·SAE 학습/Baseline 재현은 [archive](archive)에 보관했다.
 옛 문서 경로가 필요한 경우 문서 정리 전 commit `4a8dbf8`에서도 확인할 수 있다.
+
+## G. Tail Full10 + 보정 예측기
+
+현재 개발 branch는 `research/calibrated-head-tail`이다. 기존 main `183eaa9`와 기존 결과를
+수정하지 않는다. 사용자가 승인한 게시 대상은 이 branch이며 main에는 병합하지 않는다.
+**새 native 실행기의 실제 GPU 검증은 남아 있다.** 아래 명령은 이 branch의 게시 commit을
+RunPod에서 받은 뒤 사용한다.
+`prepare-run`은 추적된 소스가 깨끗한 commit이 아니면 중단한다. 결과 hash를 수동으로 바꾸지 않는다.
+
+### G1. 규모와 해석
+
+- 이미 완료한 활성 feature 6,009개의 `full-scores.json`을 재사용한다. 전체 scoring을 다시 하지 않는다.
+- 행동 평가는 **새 feature 16개 + raw/identity 2조건**, 10 tasks × 20 cases = **3,600회**다.
+- 기존 pilot/full10에서 결과를 본 22개와 팀원이 이미 평가한 ID를 제외한 뒤, Mean Head-KL·Tail
+  Head-KL·Event-max 각각의 Top-3 합집합을 포함한다. 나머지는 고정된 순위 불일치/무작위 규칙으로 채운다.
+- 여기서 Top-3는 **제외 후 후보군의 Top-3**다. 기존 전역 Top-3를 다시 평가한다는 뜻이 아니다.
+- primary는 Tail, Mean/Event-max는 비교군이다. Excess는 기본적으로 Top-3 포함을 강제하지 않는다.
+- 기존 3,600회는 약 40.9 condition-hour였다. 새 실행의 시간 보장이 아니며 준비·재시도 비용은 별도다.
+- 현재 표본의 Mean/Tail 순위가 매우 비슷하므로 Tail의 개선을 기대하거나 보장하지 않는다. 이 실행은
+  새 feature의 행동 효과를 측정하는 것이며, 새 지표의 우수성은 결과로 판단한다.
+
+원본 scorer `183eaa9`의 정확히 허용된 구현과 그 출력만 호환된다. 점수 파일/score hash는 그대로
+유지하며 현재 planner/runtime 구현을 따로 고정한다. 다른 오래된 출력까지 임의로 허용하지 않는다.
+모델·SAE·캐시·장치·산술 조건 및 현재 GPU parity가 맞아야 한다.
+
+### G2. Stop한 Pod 재시작 → GPU 테스트 → 팀 확인
+
+RunPod 화면에서 **기존 Pod을 Start/Resume**하고 접속한다. Stop 이전 tmux/process는 종료됐으므로
+새 세션을 만든다. Volume disk는 stop/start를 지나 유지되지만 container disk는 유실될 수 있다.
+`/workspace`라는 이름만으로 영속 저장이 보장되지는 않으므로 마운트와 실제 파일을 확인한다.
+출처: [RunPod storage](https://www.runpod.io/blog/where-did-my-files-go-a-straight-guide-to-runpod-storage).
+
+```bash
+event-sae-init
+source /opt/conda/etc/profile.d/conda.sh
+conda activate event-sae-openvla
+event-sae-verify --require-gpu
+df -h /workspace
+tmux new -s headrank-tail
+```
+
+이후 모든 명령은 tmux 안에서 실행한다. 동일 이름의 세션이 있으면 새로 만들지 말고
+`tmux attach -t headrank-tail`로 들어간다. BF16 연산까지 검증한다:
+
+```bash
+python -c 'import torch;x=torch.ones((128,128),device="cuda",dtype=torch.bfloat16);assert (x@x==128).all().item();print("BF16_CUDA_OK")'
+cd /workspace/Event-SAE-HeadRank
+git status --short
+git fetch origin
+git switch research/calibrated-head-tail
+git pull --ff-only origin research/calibrated-head-tail
+git rev-parse HEAD
+git status --short
+```
+
+`git status --short`에 변경이 있거나 switch/pull이 실패하면 그 상태를 확인하고 멈춘다.
+reset/clean/강제 덮어쓰기를 하지 않는다. local branch가 아직 없으면 fetch 후 switch가
+origin의 동일 이름 branch를 추적해 생성한다. 실행 중에는 코드를 더 업데이트하지 않는다.
+
+아래는 `/workspace/headrank-v1`에 기존 복원이 있는 Pod 기준이다. 새 Pod에서는 먼저 README의
+복원·현재 장치 validation을 수행한다. 종료한 Pod의 shell 변수는 복구되지 않으므로 다시 지정한다.
+
+```bash
+cd /workspace/Event-SAE-HeadRank
+STEP=/workspace/headrank-v1
+REF="$STEP/restored/results/full10-followup-v1"
+SPLIT="$STEP/restored/inputs/full10/split.json"
+OLD_CFG="$STEP/config/action-runtime.yaml"
+SCORES="$STEP/full-scores.json"
+RUN=/workspace/headrank-tail-full10-v1
+CFG="$RUN/config/action-runtime.yaml"
+CLI=scripts/openvla/headrank.py
+REG=configs/local/headrank-known.json
+mkdir -p "$RUN"
+```
+
+이전 config에서 실제 SAE/model 경로를 읽어 확인한다. 하나라도 파일이 없으면 아래 GPU 실행으로
+진행하지 않는다. Pod을 Stop했다는 이유만으로 281GiB 원본 자료를 다시 받지 않는다.
+
+```bash
+SAE=$(python -c 'import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))["inputs"]["sae_checkpoint"])' "$OLD_CFG")
+SNAP=$(python -c 'import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))["inputs"]["local_model_snapshot"])' "$OLD_CFG")
+ls -lh "$SCORES" "$SAE" "$SPLIT" "$OLD_CFG" "$SNAP/config.json"
+ls -ld "$REF/readouts" "$REF/head"
+```
+
+이전 수치 검증 결과도 보존하도록 새 runtime 디렉터리를 만든다. 이미 `$RUN/config`가 있다면
+재생성하지 말고 생성 이력을 먼저 확인한다.
+
+```bash
+python scripts/openvla/headfollowup.py stage1-setup \
+  --restored "$STEP/restored" --sae "$SAE" --snapshot "$SNAP" \
+  --output "$RUN/config"
+python scripts/openvla/output_head_sensitivity.py validate \
+  --config "$CFG" --allow-model-execution
+```
+
+정상 출력은 `status: passed`다. 이것은 모델을 실제 실행한 numerical parity 검증이며 로봇
+성공률 실험은 아니다. 이어서 기존 개발 feature 16개만 작은 점수 계산으로 확인한다:
+
+```bash
+python "$CLI" score --config "$CFG" --reference-result "$REF" \
+  --event-scores "$STEP/restored/inputs/full10/discovery_event_scores.pt" \
+  --output "$RUN/gpu-smoke.json" --execute
+```
+
+기대값은 `status: scored`, `sampling_mode: smoke`, `features: 16`, `new_rollouts: 0`,
+`development_only: true`, 두 `num_norm_invalid_*` 값 0이다. 이전 4090 smoke는 계산부 약62초였지만
+로딩·I/O 시간은 별도다. **이 결과가 나온 지점에서 먼저 확인한다.** 기존 `full-scores.json`은
+덮어쓰지 않고 본 실험에 그대로 사용한다. 새 smoke 결과로 full plan을 만들지 않는다.
+
+새 descriptor 코드도 GPU 점검할 때는 E절처럼 action mapping을 검증해서 만든 뒤 G4의
+`descriptors` 명령에 `--smoke`와 별도 output을 사용한다. 이 산출물은 학습/추론에는 못 쓴다.
+
+Stop 중 container cache만 유실되어 `processing_prismatic.py`가 없다는 오류가 나면 아래
+**고정 revision의 Python 파일 3개만** 받고 validate를 다시 실행한다:
+
+```bash
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 hf download openvla/openvla-7b \
+  configuration_prismatic.py modeling_prismatic.py processing_prismatic.py \
+  --revision 47a0ec7fc4ec123775a391911046cf33cf9ed83f
+```
+
+GPU·Torch/CUDA 버전 또는 snapshot 파일 metadata가 달라지면 prepare-run이 기존 점수 재사용을
+차단할 수 있다. parity 통과와 score identity 일치는 별개다. 이때 hash나 허용오차를 수정해
+통과시키지 말고 차이를 확인한다. 필요한 경우 점수 재계산 여부를 별도로 결정한다.
+
+원본 full score SHA-256은
+`aea94626851e0510b50085e4707b534d623867e12b8bf16068274f6d04fb2b4a`다.
+백업은 HF dataset `jiyeony/event-sae-head-full10-results`, revision
+`417c222030dab9c5c6e354a75ebb03f8057aa0b5`, 파일
+`followups/headrank-20261011T104004Z/full-scores.json`에 있다. 새 다운로드 위치를 쓴다면
+`SCORES`를 그 실제 경로로 지정한다.
+
+registry가 없다면 예시를 복사하되 **기존 registry를 덮어쓰지 않는다**:
+
+```bash
+mkdir -p configs/local
+test -e "$REG" || cp configs/research/openvla/headrank_known_features.example.json "$REG"
+```
+
+팀원에게 이미 개입 결과를 알고 있는 feature ID를 확인하고 `feature_ids`에 추가한다.
+`reviewed_for_team_prior_outcomes`는 실제 확인 후에만 `true`로 설정한다. 현재 사용자의 답은
+“팀원 확인 필요”이므로 이 확인이 남아 있다. 코드가 대신 확인 완료로 바꾸지 않는다.
+
+### G3. 3,600회 계획 동결 — 아직 실행하지 않음
+
+```bash
+python "$CLI" budget --features 16 --tasks 10 --cases-per-task 20
+python "$CLI" cases --split "$SPLIT" --cases-per-task 20 --output "$RUN/eval-cases.json"
+python "$CLI" plan --scores "$SCORES" --registry "$REG" --eval-manifest "$RUN/eval-cases.json" --preset full10 --output "$RUN/tail-plan.json"
+PLAN="$RUN/tail-plan.json"
+python "$CLI" verify-plan --plan "$PLAN"
+```
+
+16개 ID, 각 지표의 Top-3 포함 여부, `total_rollouts: 3600`을 검토한다.
+이미 있는 파일은 덮어쓰지 않는다. 설정을 바꿀 때는 새 출력 경로와 새 계획으로 만든다.
+
+### G4. 선택 사항: 같은 16개에 보정 예측을 함께 검증
+
+새 SAE를 학습하는 것이 아니다. 기존 16개 feature의 task별 성공률 하락을 이용해 **작은 ridge
+회귀 예측기**를 개발한다. feature 하나의 모든 task를 함께 제외하는 LOFO 검증을 사용하고,
+7024/24830을 함께 제외한 진단도 제공한다. 기존 자료의 편향 때문에 개발 검증이지 확증 결과는 아니다.
+고정 alpha=1이며 개발 결과를 보고 값을 계속 바꾸면 별도 탐색으로 기록해야 한다.
+
+가장 먼저 GPU 없이 기존 점수만으로 개발 진단을 만들 수 있다:
+
+```bash
+PCLI=scripts/openvla/headpredict.py
+python "$PCLI" calibrate --scores "$SCORES" --reference-result "$REF" --output "$RUN/calibration-v1"
+```
+
+`report.md`에는 zero/KL/크기·빈도·Event/Head 비교군과 feature 단위 검증이 나온다.
+좋은 결과를 가정하지 말고 이 결과부터 검토한다. **이 단계만 실행해도 로봇 rollout은 0회**다.
+
+2026-10-11 실제 기존 자료의 CPU 개발 진단(추가 descriptor 없이)에서는 Head ridge의
+feature-mean LOFO MAE가 0.1072, Spearman이 −0.2120이었다. KL ridge는 0.0920/0.3010이었다.
+큰 손상 feature 7024/24830을 학습·평가에서 모두 제외하면 모든 비상수 예측기의 MAE가
+단순한 “하락 0” 예측(0.0236)보다 나빴다. **현재 보정안의 우수성이 확인된 것이 아니며,
+이 결과를 추가 GPU 지출의 근거로 삼지 않는다.** 이후 descriptor 기반 방법은 아직 미검증이다.
+
+추가 출력 반응을 포함하려면 E절의 검증된 action mapping과 현재 GPU parity가 필요하다.
+아래 `MAPPING`은 실제 생성한 경로로 바꾼다. 기존 16개만 원래 readout 전체에서 계산한다:
+
+```bash
+MAPPING="$STEP/action-mapping.json"
+python "$PCLI" descriptors --config "$CFG" --reference-result "$REF" --mapping "$MAPPING" --output "$RUN/dev-descriptors.json" --execute
+python "$PCLI" calibrate --scores "$SCORES" --reference-result "$REF" --descriptors "$RUN/dev-descriptors.json" --output "$RUN/response-calibration-v1"
+```
+
+descriptor에는 7개 생성 위치별 action-bin 기대값의 부호/절댓값 변화, conditional KL,
+argmax 변화 등이 포함된다. 부호는 **좋다/나쁘다의 라벨이 아니며**, bin 변화는 물리적 action
+오차가 아니다. 기존 8시점 표본에서 계산하므로 전체 연속 시계열이라고 부르지 않는다.
+`--smoke` 산출물은 학습/추론 입력으로 받아들이지 않는다.
+
+보정 예측을 이번 3,600회에 붙이려면 **새 rollout 전에** 예측값을 동결한다. 먼저 선택한
+16개 ID를 확인한다:
+
+```bash
+python -c 'import json,sys;print(*json.load(open(sys.argv[1]))["panel_feature_ids"])' "$PLAN"
+```
+
+그 ID들을 다음 명령의 `--feature-ids` 뒤에 넣는다. 아래 `ID...`는 실제 정수 목록으로 바꿀
+자리이며 그대로 실행할 수 있는 값이 아니다. 간단한 `head_ridge` 예측기는 추가 descriptor가 없다:
+
+```bash
+MODEL="$RUN/calibration-v1/model.json"
+python "$PCLI" predict --model "$MODEL" --scores "$SCORES" --reference-result "$REF" --registry "$REG" --feature-ids ID... --output "$RUN/predictions.json"
+python "$PCLI" attach --plan "$PLAN" --predictions "$RUN/predictions.json" --model "$MODEL" --output "$RUN/tail-plan-with-predictions.json"
+PLAN="$RUN/tail-plan-with-predictions.json"
+```
+
+`response_ridge`를 선택한다면 위 16개에 대해서만 `descriptors --feature-ids ID...`로 새 파일을
+만들고, response 모델과 `predict --predictor response_ridge --descriptors 해당파일`을 사용한다.
+전 후보의 descriptor를 재계산할 필요는 없다. 학습·기존평가·팀 공개 ID가 섞이면 중단한다.
+`attach`는 원본 계획을 수정하지 않고 예측/모델/hash가 포함된 새 계획을 만든다. 선택한 feature,
+primary와 **3,600회 예산은 그대로**다. 보정 예측은 이 고정 패널의 보조 분석이며 전역 Top-K 성능은 아니다.
+
+### G5. 준비, 소규모 control 확인, 재개
+
+코드 변경을 마치고 승인된 clean commit에서 현재 GPU validation을 다시 수행한다.
+이 문서는 자동 commit/push나 유료 실행의 승인이 아니다.
+
+```bash
+python scripts/openvla/output_head_sensitivity.py validate --config "$CFG" --allow-model-execution
+python "$CLI" prepare-run --config "$CFG" --plan "$PLAN" --scores "$SCORES" --registry "$REG" --eval-manifest "$RUN/eval-cases.json" --reference-result "$REF" --split "$SPLIT" --output "$RUN/execution.json" --run-output "$RUN/runs" --max-rollouts 3600
+python "$CLI" run --experiment "$RUN/execution.json"
+```
+
+여기까지는 validation 외에 로봇 rollout이 없다. 계획 내용/비용을 승인하고 tmux 안에서만 다음을 진행한다:
+
+```bash
+EXEC_HASH=$(python -c 'import json,sys;print(json.load(open(sys.argv[1]))["execution_hash"])' "$RUN/execution.json")
+CODE_REV=$(git rev-parse HEAD)
+python "$CLI" run --experiment "$RUN/execution.json" --execute --approved-execution-hash "$EXEC_HASH" --expected-code-revision "$CODE_REV" --max-new-attempts 2
+```
+
+첫 raw/identity 1쌍 이후 `paused`는 정상이다. 이것만으로 제거 개입 검증을 마쳤다는 뜻은 아니다.
+확인 후 같은 명령에서 `--max-new-attempts 2`를 빼면 재개한다. 완료 case는 건너뛰고 모든
+200개 raw/identity 대조를 통과해야 제거 조건으로 진행한다. 재시도 reserve는 기본 0이며,
+중단된 attempt가 있으면 자동으로 예산을 늘려 재시작하지 않는다. 실행 중 코드/계획을 바꾸지 않는다.
+
+```bash
+python "$CLI" run --experiment "$RUN/execution.json" --execute --approved-execution-hash "$EXEC_HASH" --expected-code-revision "$CODE_REV"
+python "$CLI" status --experiment "$RUN/execution.json"
+python "$CLI" analyze --experiment "$RUN/execution.json" --output "$RUN/analysis-v1"
+```
+
+분석은 모든 예정 case와 개입 증거가 있어야 완료된다. Tail/Mean/Event-max의 고정 패널 비교,
+paired signed drop, Top-K와 uncertainty를 보고한다. 예측을 붙였다면 feature 평균 예측의 MAE와
+Spearman도 별도로 보고한다. 보정 예측이 개선되었다고 자동 결론내리지 않는다.
+이전 데이터의 초기상태/수집 flag 미확인, 기존 SAE/cluster 재사용, 이미 사용한 평가 라벨 이력은
+이번 계획에서도 없어지지 않는다. 새 feature 평가와 완전히 새 task/환경 일반화는 다른 주장이다.

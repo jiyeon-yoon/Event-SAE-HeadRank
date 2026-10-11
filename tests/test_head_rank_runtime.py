@@ -180,6 +180,96 @@ def test_prepare_is_model_free_and_freezes_all_sources(tmp_path, monkeypatch):
     runtime.verify_experiment(experiment)
 
 
+def legacy_v2_fixture(tmp_path, monkeypatch):
+    from event_sae.research.head_rank import workflow
+    from event_sae.research.head_rank.compatibility import LEGACY_SCORER_IMPLEMENTATION
+    fixture = fixture_files(tmp_path, monkeypatch)
+    kwargs = fixture["kwargs"]
+    current = workflow.implementation_identity()
+    monkeypatch.setattr(runtime, "implementation_identity", lambda: deepcopy(current))
+    # Only this synthetic test score fixture is resealed; the real legacy input
+    # remains read-only and is never rewritten by the workflow.
+    fixture["scores"]["implementation"] = deepcopy(LEGACY_SCORER_IMPLEMENTATION)
+    write(kwargs["scores_path"], seal(fixture["scores"], "score_hash"))
+    before = sha256_file(kwargs["scores_path"])
+    kwargs["plan_path"] = tmp_path / "legacy-v2-plan.json"
+    workflow.plan_workflow(kwargs["scores_path"], kwargs["plan_path"],
+        registry=kwargs["registry_path"], eval_manifest=kwargs["eval_manifest"],
+        feature_count=16, cases_per_task=1, selection_strategy="topk_union")
+    assert sha256_file(kwargs["scores_path"]) == before
+    fixture["plan"] = read_json(kwargs["plan_path"])
+    return fixture
+
+
+def test_pinned_legacy_v2_prepare_and_cpu_fake_runtime(tmp_path, monkeypatch):
+    fixture = legacy_v2_fixture(tmp_path, monkeypatch)
+    result = runtime.prepare_execution(**fixture["kwargs"])
+    assert result["total_rollouts"] == 36  # 16 + raw + identity, 2 fake cases.
+    exp = read_json(fixture["kwargs"]["output"])
+    bindings = exp["prediction_plan"]["source_bindings"]
+    assert bindings["scoring_implementation"] != exp["implementation"]
+    assert bindings["scorer_compatibility"]["mode"] == "pinned_legacy_v1"
+    assert len(fixture["parity_calls"]) == 1
+    monkeypatch.setattr(native, "NativeBackend", CPUFakeBackend)
+    CPUFakeBackend.instances.clear()
+    result = runtime.run_execution(fixture["kwargs"]["output"],
+        approved_hash=exp["execution_hash"], expected_revision=CODE["commit"])
+    assert result["status"] == "completed" and result["new_attempts"] == 36
+    assert len(CPUFakeBackend.instances[-1].calls) == 36
+    assert len(fixture["parity_calls"]) == 2
+
+
+@pytest.mark.parametrize("change", ["dirty", "identity", "parity", "registry", "score", "binding"])
+def test_legacy_exception_never_bypasses_existing_runtime_gates(tmp_path, monkeypatch, change):
+    fixture = legacy_v2_fixture(tmp_path, monkeypatch)
+    kwargs = fixture["kwargs"]
+    if change == "dirty":
+        monkeypatch.setattr(runtime, "git_identity", lambda _: {**CODE, "dirty": True})
+    elif change == "identity":
+        monkeypatch.setattr(old_workflow, "numerical_identity", lambda _: {"other_device": True})
+    elif change == "parity":
+        def stale_parity(*args):
+            raise ValueError("Current numerical parity must be freshly validated")
+        monkeypatch.setattr(old_workflow, "load_parity", stale_parity)
+    elif change == "registry":
+        write(kwargs["registry_path"], {"reviewed_for_team_prior_outcomes": False, "feature_ids": []})
+    elif change == "score":
+        modified = deepcopy(fixture["scores"])
+        modified["feature_scores"][0]["tail_head_kl"] += 1
+        write(kwargs["scores_path"], seal(modified, "score_hash"))
+    else:
+        modified = deepcopy(fixture["plan"])
+        modified["source_bindings"]["scoring_implementation"] = {"unsupported": True}
+        write(kwargs["plan_path"], seal(modified, "plan_hash"))
+    with pytest.raises(ValueError):
+        runtime.prepare_execution(**kwargs)
+    assert not kwargs["output"].exists() and not kwargs["run_output"].exists()
+
+
+def test_full10_preset_never_shrinks_to_small_fixture_scope(tmp_path, monkeypatch):
+    from event_sae.research.head_rank.workflow import plan_workflow
+    fixture = legacy_v2_fixture(tmp_path, monkeypatch)
+    kwargs = fixture["kwargs"]
+    target = tmp_path / "invalid-full10-plan.json"
+    with pytest.raises(ValueError, match="Full10 requires"):
+        plan_workflow(kwargs["scores_path"], target, registry=kwargs["registry_path"],
+                      feature_count=16, cases_per_task=20, selection_strategy="topk_union",
+                      require_full10=True)
+    assert not target.exists()
+
+
+def test_legacy_plan_workflow_keeps_unreviewed_registry_blocked(tmp_path, monkeypatch):
+    from event_sae.research.head_rank.workflow import plan_workflow
+    fixture = legacy_v2_fixture(tmp_path, monkeypatch)
+    kwargs = fixture["kwargs"]
+    write(kwargs["registry_path"], {"reviewed_for_team_prior_outcomes": False, "feature_ids": []})
+    target = tmp_path / "unreviewed-plan.json"
+    with pytest.raises(ValueError, match="with your team"):
+        plan_workflow(kwargs["scores_path"], target, registry=kwargs["registry_path"],
+                      feature_count=16, cases_per_task=1, selection_strategy="topk_union")
+    assert not target.exists()
+
+
 def test_prepare_execute_resume_analyze_real_journal_with_cpu_backend(tmp_path, monkeypatch):
     fixture, result, experiment = prepared(tmp_path, monkeypatch)
     monkeypatch.setattr(native, "NativeBackend", CPUFakeBackend)
