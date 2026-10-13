@@ -4,12 +4,151 @@
 중요도 순위**를 예측하는 후속 개발 저장소다. `headrank.py`는 비학습 순위 실험이고,
 `headpredict.py`는 별도의 **개발용 성공률 하락 보정 예측기**다. 두 결과를 혼동하지 않는다.
 
-**현재 구현: 오프라인 점수 계산 → 예측/평가 계획 고정 → native 행동 평가 연결 →
-개입 검증·중단/재개 → paired 결과 분석. 기존 v1 전체 점수 계산은 완료했지만
-새 feature 행동 평가와 이번 추가 코드의 GPU 검증은 미완료다. CPU/mock 테스트는 실제 로봇·GPU 검증이 아니다. 예측 개선이나
-논문 기여가 입증된 상태는 아니다.**
+**2026-10-13 상태:** 기존 새 feature 16개 / 3,600회 행동 평가는 완료했다.
+Tail의 Mean 대비 개선은 확인되지 않았다. 아래 추가 진단은 별도 브랜치
+`research/taskwise-matched-controls`에서 개발하며, 기존 `7dbdf74` 소스·결과는 보존한다.
+① task별 CPU 재분석은 완료했고, ③ 변경량 맞춤 대조는 코드·CPU 테스트만 완료했다.
+**③의 실제 GPU hook 검증과 새 rollout은 아직 미실행이다.**
 
-## 현재 실행 경로 — 기존 Full10과 같은 규모
+## 추가 진단 ① — task별 점수 재분석 (GPU 불필요)
+
+질문: 전체 task 평균 점수 때문에 특정 task의 중요한 feature가 가려졌는가?
+동일한 새 16개 feature × 10 task × 20개 초기상태의 기존 결과를 사용한다.
+각 task에서 16개 feature의 순위 상관을 계산한 뒤 10개 task를 동일 가중 평균한다.
+전체 task를 먼저 평균했던 이전 Spearman과 **다른 통계량**이므로 직접 크기를 비교하지 않는다.
+
+| 점수 | 전체 task 공통 점수 사용 | task별 점수 사용 | 변화의 paired 95% CI |
+|---|---:|---:|---|
+| Mean Head-KL | 0.0601 | 0.0559 | [-0.0123, 0.0065] |
+| Tail Head-KL | 0.0601 | 0.0490 | [-0.0180, 0.0016] |
+| Event-max | 0.0053 | 0.0016 | [-0.0323, 0.0138] |
+
+**이 패널에서 task별 점수화에 따른 개선은 확인되지 않았다.** 동등성이나 모든 feature에
+대한 부정적 결론은 아니다. 정수 성공/실패 차이로 동점을 처리하고, task 안의 동일 초기상태를
+모든 feature·방법에 공유 재표집했다(2,000회, seed1729). 고정 패널에 대한 사후 분석이다.
+원본 백업: HF `84bfc5fd633fdea0fd9b6c35cd52a605b19d7ead`,
+`followups/headrank-tail-backup.UhyVeF`.
+
+Pod에 이전 자료가 그대로 있으면 CPU 재실행 예시는 다음과 같다. 출력 폴더는 새 경로여야 한다.
+
+```bash
+python scripts/openvla/headtaskwise.py \
+  --scores /workspace/headrank-v1/full-scores.json \
+  --analysis /workspace/headrank-tail-full10-v1/analysis-v1/analysis.json \
+  --experiment /workspace/headrank-tail-full10-v1/execution-v2.json \
+  --event-scores /workspace/headrank-v1/restored/inputs/full10/discovery_event_scores.pt \
+  --output /workspace/headrank-taskwise-v1
+```
+
+## 추가 진단 ③ — 같은 크기, 다른 방향 (GPU 필요)
+
+질문: **같은 현재 hidden에서 변경량 크기를 맞춰도, KL이 큰 방향일수록 성공률이 더 떨어지는가?**
+이전 결과에서 영향이 컸던 `30452`를 anchor로 사용한다. 기존 점수 파일에서 이미 고정한
+decoder 방향 `[30026, 8837, 4349, 25697]` 네 개를 모두 사용한다. 이 ID들의 feature를
+자연스럽게 제거하는 실험이 아니다. **30452 제거의 활성 시점과 크기를 빌려 다른 방향으로
+hidden을 바꾸는 대조**다. 유리한 대조만 사후 선택하지 않는다.
+
+- 조건 7개: raw, identity, 30452 제거, 대조 방향 4개.
+- 기본 동작 점검: **10 task × 2 초기상태 × 7조건 = 140회**, 자동 확대 없음.
+- 첫 실행은 `--max-new-attempts 4`: 같은 case에서 raw → identity → anchor → 첫 대조를 확인한다.
+- 5방향 KL은 같은 14,000 discovery readout에서 현재 GPU로 다시 계산한다.
+  anchor 하나만 처리하므로 수정 pair는 최대 70,000개이고, 로봇 rollout은 0회다.
+- 이후 현재 GPU에서 실제 7-token 생성의 개입 hidden·출력층 일치와 모든 대조의 norm을 검증한다.
+  기존 feature-removal parity만으로 새 hook을 승인하지 않는다.
+- BF16 cast 후 **실현된 변경량**도 상대 5% + 절대 1e-5 이내인지 모든 row에서 검사한다.
+  실패하면 중단하고, 로봇 작업 실패로 바꿔 기록하지 않는다.
+- raw/identity의 행동 및 성공 여부가 동일한지 각 case에서 확인한 뒤 개입한다.
+- 분석: 5방향 KL 대 signed 성공률 하락의 상관(주 지표), anchor 하락 − 4대조 평균 하락(보조).
+  같은 초기상태를 공유 재표집하며, 상관이 정의되지 않는 bootstrap은 숨기지 않는다.
+
+**한계:** 사후 선택한 anchor 하나와 방향 네 개의 진단이다. 140회가 독립적인 140개
+feature 예측이 아니며, 검정력·논문 결론을 보장하지 않는다. 이후 trajectory가 갈라지므로
+episode 전체 누적 변경량이나 활성 횟수까지 같지는 않다. 이 결과로 의미론적 feature,
+새 feature 예측력, Tail의 우월성을 입증했다고 주장하지 않는다. 1,400회 확대는 별도 결정이다.
+
+### 기존 Pod에서의 순서
+
+**먼저 이 새 브랜치의 검토된 코드를 commit/push하고 Pod에 내려받아야 한다.** 이 문서는
+자동 commit/push나 실행을 하지 않는다. 기존 `research/calibrated-head-tail`에서 새 CLI를
+찾을 수는 없다. 실행 중인 기존 job이 없는 상태에서 새 clean commit을 사용한다.
+
+```bash
+cd /workspace/Event-SAE-HeadRank
+git fetch origin
+git switch research/taskwise-matched-controls
+git pull --ff-only origin research/taskwise-matched-controls
+git status --short
+
+CLI=scripts/openvla/headmatched.py
+OLD=/workspace/headrank-tail-full10-v1
+STEP=/workspace/headrank-v1
+M=/workspace/headrank-matched-v1
+CFG="$OLD/config/action-runtime.yaml"
+REF="$STEP/restored/results/full10-followup-v1"
+```
+
+이전 config·base parity를 읽기 전용으로 사용한다. 입력 파일이나 환경이 달라 기존 parity가
+유효하지 않으면 원본을 수정하지 말고 별도 runtime config·validation 경로부터 준비한다.
+완료된 파일을 덮어쓰지 않으며, 재시작 시 완료된 단계를 건너뛴다.
+
+```bash
+python "$CLI" plan \
+  --scores "$STEP/full-scores.json" \
+  --parent-experiment "$OLD/execution-v2.json" \
+  --output "$M/plan.json"
+
+python "$CLI" score \
+  --config "$CFG" --plan "$M/plan.json" \
+  --reference-result "$REF" --output "$M/scores.json" --execute
+
+python "$CLI" validate \
+  --config "$CFG" --plan "$M/plan.json" \
+  --output "$M/validation.json" --allow-model-execution
+```
+
+`score: scored`, `validate: passed` 확인 후:
+
+```bash
+python "$CLI" prepare-run \
+  --config "$CFG" --plan "$M/plan.json" \
+  --scores "$M/scores.json" --validation "$M/validation.json" \
+  --output "$M/execution.json" --run-output "$M/runs" \
+  --max-rollouts 140
+
+EXP="$M/execution.json"
+HASH=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["execution_hash"])' "$EXP")
+REV=$(git rev-parse HEAD)
+
+python -u "$CLI" run --experiment "$EXP" --execute \
+  --approved-execution-hash "$HASH" --expected-code-revision "$REV" \
+  --max-new-attempts 4
+```
+
+여기서 멈추고 오류·norm 기록·실제 소요시간을 확인한다. 이전 3,600회 실험 속도를 새
+hook에 그대로 적용하지 않는다. 실행기는 모델을 재사용하지만 대조는 같은 hidden의
+anchor와 control 변경량을 둘 다 계산하므로 추가 비용이 있다. 4회 결과로 예측력 결론을 내리지 않는다.
+
+계속하기로 결정하면 **같은 실행 계약**으로 나머지만 재개한다:
+
+```bash
+python -u "$CLI" run --experiment "$EXP" --execute \
+  --approved-execution-hash "$HASH" --expected-code-revision "$REV"
+
+python "$CLI" status --experiment "$EXP"
+python "$CLI" analyze --experiment "$EXP" --output "$M/analysis-v1"
+```
+
+기본 retry reserve는 0이다. 환경·수치 오류 발생 시 원인을 확인하고 별도 예산 결정을 한다.
+실패 attempt를 삭제하거나 해시·허용오차를 수정해 통과시키지 않는다.
+새 파일들은 기존 전체 실험 파일과 분리된다. GPU 검증 완료 전에는 정상 동작을 보장하지 않는다.
+
+CPU 검증:
+
+```bash
+python -m pytest -q tests/test_head_taskwise.py tests/test_head_matched_*.py
+```
+
+## 기존 실행 경로 기록 — Full10과 같은 규모
 
 개발 브랜치: `research/calibrated-head-tail`. 원래 `main`의 `183eaa9`와 이미 계산한
 점수/행동 결과는 보존한다. 이 변경은 자동 commit/push 또는 GPU 실행을 하지 않는다.
