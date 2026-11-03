@@ -1,4 +1,15 @@
-# Event-SAE HeadRank
+# Event-SAE Taylor comparison
+
+전용 브랜치 `research/taylor-comparison`에서 기존 HeadRank 실험을 보존하고
+Taylor 중요도 비교군을 추가한다. 새 rollout·SAE 학습은 **0회**다.
+
+**새 실행은 [Taylor 새 RunPod 안내](docs/run_taylor_comparison.md)를 따른다.**
+최소 입력 복원 → 현재 GPU 수치 검증 → smoke/full → 두 기존 집단 분리 비교 → 백업 순서다.
+현재 GPU 경로는 미실행이다. 새 Pod에서는 이 브랜치를 받아 게시된 commit을 확인한 뒤 실행한다.
+
+아래는 기반 HeadRank의 기존 연구 이력이다. 최신 실제 결과·완료 여부는 각각의 고정 백업을 따른다.
+
+# Event-SAE HeadRank (inherited history)
 
 기존 실험을 보존하면서 **출력층 민감도로 아직 행동 평가하지 않은 SAE feature의
 중요도 순위**를 예측하는 후속 개발 저장소다. `headrank.py`는 비학습 순위 실험이고,
