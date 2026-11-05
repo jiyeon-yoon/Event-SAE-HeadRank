@@ -98,6 +98,42 @@ def test_task_weighted_outcomes_not_pooled_when_task_sizes_differ():
     assert effect["pooled_outcome_flip"] == pytest.approx(1 / 3)
 
 
+def count_panel(harms, repairs):
+    paired = []
+    for task, (harm, repair) in enumerate(zip(harms, repairs)):
+        for i in range(20):
+            raw = i < 10
+            edit = (i >= harm) if raw else (i < 10 + repair)
+            paired.append({"feature_id": 0, "suite": "suite", "task_id": task,
+                "task_episode_idx": i, "initial_state_sha256": f"{task}-{i}", "seed": 0,
+                "raw_success": raw, "edit_success": edit, "drop": int(raw) - int(edit)})
+    h, r = sum(harms), sum(repairs)
+    return {"synthetic": True, "feature_ids": [0], "paired_rows": paired,
+        "feature_effects": [{"feature_id": 0, "drop": (h - r) / len(paired),
+            "num_pairs": len(paired), "n_success_to_failure": h, "n_failure_to_success": r,
+            "n_success_to_success": 10 * len(harms) - h,
+            "n_failure_to_failure": 10 * len(harms) - r}]}
+
+
+def test_integer_count_cancellation_is_exact_zero_not_false_rank_difference():
+    # Actual 31089 task-level harm/repair counts from the frozen later panel.
+    data = count_panel([1, 1, 0, 1, 1, 2, 3, 2, 3, 3], [1, 0, 3, 2, 2, 1, 1, 2, 2, 3])
+    effect = read_panel(data)[0]
+    assert effect["success_to_failure"] == effect["failure_to_success"] == 17
+    assert effect["signed_drop"] == 0.
+    assert effect["outcome_flip"] == 34 / 200
+    data["paired_rows"].reverse()
+    assert read_panel(data)[0] == effect
+
+
+def test_identical_count_rates_preserve_ties_across_different_task_distributions():
+    a = count_panel([1, 1, 0, 1, 1, 2, 3, 2, 3, 3], [1, 0, 3, 2, 2, 1, 1, 2, 2, 3])
+    b = count_panel([2, 2, 2, 2, 2, 2, 2, 1, 1, 1], [2, 2, 2, 2, 2, 2, 2, 1, 1, 1])
+    aa, bb = read_panel(a)[0], read_panel(b)[0]
+    assert aa["signed_drop"] == bb["signed_drop"] == 0.
+    assert aa["outcome_flip"] == bb["outcome_flip"] == 34 / 200
+
+
 @pytest.mark.parametrize("mutation", [
     lambda d: d["paired_rows"].append(copy.deepcopy(d["paired_rows"][0])),
     lambda d: d["feature_effects"][0].update(n_success_to_failure=99),

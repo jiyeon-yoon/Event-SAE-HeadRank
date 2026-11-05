@@ -7,6 +7,7 @@ descriptive point estimates, not a prospective prediction benchmark.
 from __future__ import annotations
 
 from collections import defaultdict
+from fractions import Fraction
 import math
 from pathlib import Path
 
@@ -184,10 +185,14 @@ def read_panel(data):
         for selected in tasks.values():
             harm = sum(raw[key] and not current[key]["edit_success"] for key in selected)
             repair = sum(not raw[key] and current[key]["edit_success"] for key in selected)
-            drop_by_task.append((harm - repair) / len(selected))
-            flip_by_task.append((harm + repair) / len(selected))
-        drop = math.fsum(drop_by_task) / len(tasks)
-        flip = math.fsum(flip_by_task) / len(tasks)
+            # Rates are ratios of integer counts, not arbitrary measured
+            # reals. Preserve exact mathematical ties before rank assignment.
+            # Floating task averaging can turn e.g. 17 harms/17 repairs into
+            # 1e-18 instead of zero and spuriously split a Spearman tie.
+            drop_by_task.append(Fraction(harm - repair, len(selected)))
+            flip_by_task.append(Fraction(harm + repair, len(selected)))
+        drop = float(sum(drop_by_task, Fraction()) / len(tasks))
+        flip = float(sum(flip_by_task, Fraction()) / len(tasks))
         if abs(_number(stored[fid].get("drop"), "stored drop", -1., 1.) - drop) > 1e-10:
             raise ValueError("stored task-weighted drop differs from paired outcomes")
         result[fid] = {"feature_id": fid, "num_pairs": len(keys), "num_tasks": len(tasks),
@@ -246,6 +251,7 @@ def compare_data(scores, panels, *, top_k=3):
         "sampling_mode": scores["sampling_mode"], "development_only": scores["development_only"],
         "scope": SCOPE, "uncertainty": "descriptive point estimates; no confidence intervals or hypothesis tests",
         "rank_ties": "average ranks for correlation; lower feature ID breaks Top-K ties",
+        "outcome_arithmetic": "exact per-task rational counts; float conversion once after equal-task averaging",
         "flip_definition": "equally task-weighted mean(success-to-failure + failure-to-success)/cases within task",
         "population": "scored cached-active feature pool, not the entire dictionary",
         "panels": output}
@@ -282,6 +288,7 @@ def report_markdown(result):
         "- Global Top-K means Top-K of the supplied scored pool. Missing effects remain undefined; measured lower ranks are never substituted.",
         "- These panels were selected using previous rankings and outcomes were already available. This is retrospective, not independent confirmation or all-feature prediction accuracy.",
         "- Values are descriptive point estimates, without uncertainty intervals or multiple-comparison claims.",
+        "- Outcome rates use exact integer-count fractions before conversion to floats, preserving mathematical ties for Spearman ranks.",
         "- A positive signed drop means harm; an outcome flip also includes improvements and is not a measure of damage alone.",
         "- Historical collection metadata, SAE training overlap, seed protocol and hardware differences are not repaired by this analysis.",
         "- This report neither establishes a new method's novelty nor semantic or task-specific feature meaning.", ""]
@@ -331,6 +338,7 @@ def compare_workflow(scores_path, panels, output, *, top_k=3):
     result["sources"] = {"scores": {"path": str(Path(scores_path).resolve()), "sha256": sha256_file(scores_path)},
         "panels": [{"name": name, "path": str(path.resolve()), "sha256": sha256_file(path)}
                    for (name, _), path in zip(panels, paths)]}
+    result["comparison_implementation_sha256"] = sha256_file(__file__)
     result["comparison_hash"] = fingerprint(result)
     target.mkdir(parents=True, exist_ok=False)
     atomic_write_json(target / "comparison.json", result)
