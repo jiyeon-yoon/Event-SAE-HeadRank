@@ -11,6 +11,7 @@ import math
 import time
 
 import torch
+from torch.nn import functional as F
 
 from event_sae.research.head_rank.scoring import _parity, query_index
 from event_sae.research.output_head.sensitivity import (
@@ -28,24 +29,49 @@ def _sync(device):
 def decoder_vectors(sae, feature_ids, dict_size, hidden_dim, *, device, block_size=32):
     """Actual decoder columns, bias removed, NEVER unit-normalized.
 
-The known frozen BatchTopK decoder is affine. Use its public decode API rather
-than guessing checkpoint weight orientation. A row-level affine consistency
-gate below additionally checks the actual cached latent values.
+The pinned BatchTopK decoder is nn.Linear(F,D,bias=False) plus b_dec.
+Read the declared weight columns directly. decode(unit)-decode(0) is unsafe:
+adding/subtracting a large bias in FP32 can erase small column coefficients.
+The public decode API is checked against the declared dense graph below.
 """
-    zero = torch.zeros((1, dict_size), dtype=torch.float32, device=device)
-    intercept = sae.decode(zero)
-    if intercept.shape != (1, hidden_dim) or not torch.isfinite(intercept).all():
-        raise ValueError("SAE decoder has an incompatible intercept")
-    columns = []
-    for start in range(0, len(feature_ids), block_size):
-        selected = feature_ids[start:start + block_size]
-        basis = torch.zeros((len(selected), dict_size), dtype=torch.float32, device=device)
-        basis[torch.arange(len(selected), device=device), selected] = 1
-        values = sae.decode(basis) - intercept
-        if values.shape != (len(selected), hidden_dim) or not torch.isfinite(values).all():
-            raise ValueError("SAE decoder has invalid feature columns")
-        columns.append(values)
-    return torch.cat(columns), intercept
+    decoder, bias = getattr(sae, "decoder", None), getattr(sae, "b_dec", None)
+    if (type(decoder) is not torch.nn.Linear or decoder.bias is not None
+            or decoder.in_features != dict_size or decoder.out_features != hidden_dim):
+        raise ValueError("Taylor requires the verified bias-free nn.Linear BatchTopK decoder")
+    if (not isinstance(bias, torch.Tensor) or bias.shape != (hidden_dim,)
+            or bias.dtype != torch.float32 or decoder.weight.dtype != torch.float32
+            or bias.device != torch.device(device) or decoder.weight.device != torch.device(device)
+            or not torch.isfinite(decoder.weight).all() or not torch.isfinite(bias).all()):
+        raise ValueError("SAE decoder weights/b_dec must be finite FP32 on the scoring device")
+    if (not feature_ids or len(set(feature_ids)) != len(feature_ids)
+            or any(type(fid) is not int or not 0 <= fid < dict_size for fid in feature_ids)):
+        raise ValueError("Invalid decoder feature columns")
+    positions = torch.tensor(feature_ids, dtype=torch.int64, device=device)
+    vectors = decoder.weight.detach().T.index_select(0, positions).contiguous()
+    return vectors, bias.detach()[None, :]
+
+
+@torch.inference_mode()
+def check_decoder_affine(sae, z, row_values, directions, intercept):
+    """Separate real decoder mismatch from dense/sparse FP32 summation error.
+
+1. Compare public decode with the SAME dense FP32 graph (including bias).
+2. Check selected-column equivalence in FP64, with unchanged strict tolerances.
+3. Record, but do not misclassify, differently ordered FP32 sparse summation.
+No native-head/edit parity tolerance is modified.
+"""
+    actual = sae.decode(z)
+    declared = F.linear(z, sae.decoder.weight) + intercept
+    if (actual.shape != declared.shape or not torch.isfinite(actual).all()
+            or not torch.equal(actual, declared)):
+        raise ValueError("SAE decode differs from its declared affine dense graph")
+    sparse = row_values @ directions + intercept
+    dense64 = F.linear(z.double(), sae.decoder.weight.double()) + intercept.double()
+    sparse64 = row_values.double() @ directions.double() + intercept.double()
+    if not torch.allclose(dense64, sparse64, rtol=1e-10, atol=1e-10):
+        raise ValueError("SAE decoder column mapping is not consistent in FP64")
+    return {"fp32_sparse_vs_native_max_abs_error": float((actual - sparse).abs().max()),
+            "fp64_column_max_abs_error": float((dense64 - sparse64).abs().max())}
 
 
 def _integer(value, name):
@@ -92,7 +118,7 @@ subsets are separately and explicitly marked by the workflow).
     counts = torch.zeros(len(active_ids), dtype=torch.int64)
     frequency = torch.zeros(len(active_ids), dtype=torch.float64)
     edit_norm = torch.zeros(len(active_ids), dtype=torch.float64)
-    max_affine_error = 0.
+    max_affine_error, max_fp64_column_error, affine_checks = 0., 0., 0
     max_logit_error, target_mismatches, targets_outside_canonical = 0., 0, 0
     executed = 0
     _sync(device)
@@ -125,12 +151,10 @@ subsets are separately and explicitly marked by the workflow).
             if index < 7 or (index + 1) % 1000 == 0:
                 z = torch.zeros((1, width), dtype=torch.float32, device=device)
                 z[0, ids[index].to(device)] = values[index].to(device)
-                actual = sae.decode(z)
-                predicted = z_values @ directions + intercept
-                error = float((actual - predicted).abs().max())
-                max_affine_error = max(max_affine_error, error)
-                if not torch.allclose(actual, predicted, rtol=1e-4, atol=1e-4):
-                    raise ValueError("SAE decode is not consistent with affine natural feature contributions")
+                audit = check_decoder_affine(sae, z, z_values, directions, intercept)
+                max_affine_error = max(max_affine_error, audit["fp32_sparse_vs_native_max_abs_error"])
+                max_fp64_column_error = max(max_fp64_column_error, audit["fp64_column_max_abs_error"])
+                affine_checks += 1
         if progress and ((index + 1) % 100 == 0 or index + 1 == len(records)):
             _sync(device)
             elapsed = time.perf_counter() - scoring_started
@@ -164,6 +188,10 @@ subsets are separately and explicitly marked by the workflow).
                             "native_targets_outside_documented_256_support": targets_outside_canonical
                                 if head.head_weight.shape[0] == 32064 else None,
                             "max_decoder_affine_abs_error": max_affine_error,
+                            "decoder_vector_source": "declared_nn_linear_weight_columns_no_bias_subtraction",
+                            "decoder_affine_check": "exact_native_vs_dense_fp32_graph_and_fp64_column_equivalence",
+                            "decoder_affine_checks": affine_checks,
+                            "max_decoder_fp64_column_abs_error": max_fp64_column_error,
                             "preparation_seconds": preparation_seconds, "scoring_seconds": scoring_seconds,
                             "total_seconds": preparation_seconds + scoring_seconds},
             "new_rollouts": 0, "sae_training": False, "model_regeneration": False}

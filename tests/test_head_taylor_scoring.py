@@ -4,7 +4,7 @@ import copy
 import pytest
 import torch
 
-from event_sae.research.head_taylor.scoring import score_cache, decoder_vectors, benchmark_exact_kl
+from event_sae.research.head_taylor.scoring import score_cache, decoder_vectors, benchmark_exact_kl, check_decoder_affine
 from event_sae.research.head_taylor.kernels import token_nll_gradient
 from event_sae.research.output_head.head import OutputHeadBundle
 
@@ -12,6 +12,10 @@ from event_sae.research.output_head.head import OutputHeadBundle
 class ToySAE:
     def __init__(self):
         self.columns = torch.tensor([[2., .3], [-.4, .7], [.8, -.2]])
+        self.decoder = torch.nn.Linear(3, 2, bias=False)
+        with torch.no_grad():
+            self.decoder.weight.copy_(self.columns.T)
+        self.b_dec = torch.tensor([.3, -.1])
         self.calls = 0
 
     def encode(self, hidden):
@@ -19,7 +23,7 @@ class ToySAE:
 
     def decode(self, z):
         self.calls += 1
-        return z @ self.columns.to(z.device) + torch.tensor([.3, -.1], device=z.device)
+        return self.decoder(z) + self.b_dec
 
 
 def head():
@@ -157,3 +161,59 @@ def test_one_native_target_and_gradient_per_readout(monkeypatch):
     result = score_cache(c, CountingHead(), ToySAE())
     assert result["diagnostics"]["active_pairs"] == 9
     assert calls == {"prepared": 1, "native": 14, "gradient": 14}
+
+
+def test_large_bias_cancellation_uses_exact_weights_not_unit_decode_subtraction():
+    class BiasedSAE:
+        def __init__(self):
+            self.decoder = torch.nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                self.decoder.weight.copy_(torch.tensor([[-.01, .02], [.03, -.01]]))
+            self.b_dec = torch.tensor([100., 0.])
+        def decode(self, z):
+            return self.decoder(z) + self.b_dec
+    s = BiasedSAE()
+    z = torch.tensor([[10000., 0.]])
+    zero = torch.zeros(1, 2)
+    old = s.decode(torch.eye(2)) - s.decode(zero)
+    assert not torch.allclose(s.decode(z), z @ old + s.decode(zero), rtol=1e-4, atol=1e-4)
+    vectors, bias = decoder_vectors(s, [0, 1], 2, 2, device="cpu")
+    assert torch.equal(vectors, s.decoder.weight.T)
+    audit = check_decoder_affine(s, z, z, vectors, bias)
+    assert audit["fp64_column_max_abs_error"] == 0
+
+
+def test_decoder_wrong_column_order_rejected_even_if_dimensions_match():
+    s = ToySAE()
+    vectors, bias = decoder_vectors(s, [0, 1], 3, 2, device="cpu")
+    z = torch.tensor([[.4, .2, 0.]])
+    with pytest.raises(ValueError, match="column mapping"):
+        check_decoder_affine(s, z, z[:, :2], vectors.flip(0), bias)
+
+
+def test_unsupported_or_nonfinite_declared_decoder_rejected():
+    s = ToySAE()
+    s.decoder = torch.nn.ReLU()
+    with pytest.raises(ValueError, match="nn.Linear"):
+        decoder_vectors(s, [0], 3, 2, device="cpu")
+    s = ToySAE()
+    s.b_dec[0] = float("nan")
+    with pytest.raises(ValueError, match="finite FP32"):
+        decoder_vectors(s, [0], 3, 2, device="cpu")
+
+
+def test_fp32_summation_order_difference_is_diagnostic_not_nonlinearity():
+    class CancellationSAE:
+        def __init__(self):
+            self.decoder = torch.nn.Linear(3, 1, bias=False)
+            with torch.no_grad():
+                self.decoder.weight.copy_(torch.tensor([[1e8, 1., -1e8]]))
+            self.b_dec = torch.zeros(1)
+        def decode(self, z):
+            return self.decoder(z) + self.b_dec
+    s = CancellationSAE()
+    z = torch.ones(1, 3)
+    vectors, bias = decoder_vectors(s, [0, 2, 1], 3, 1, device="cpu")
+    audit = check_decoder_affine(s, z, z, vectors, bias)
+    assert audit["fp32_sparse_vs_native_max_abs_error"] > 0
+    assert audit["fp64_column_max_abs_error"] == 0
