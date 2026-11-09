@@ -41,19 +41,23 @@ Top-5가 같을지 여부는 이번 500개 점수를 계산한 다음 확정한�
 U는 5~15개이므로 본 평가 범위는 3,500~8,500회이며, `plan`이 정확한 수를 출력한다.
 과거 250개 점수에서 합집합은 8개였지만 **이번에도 8개라는 보장은 없다.**
 
-본 평가와 별도로 **사전 검증 402회**가 필요하다.
+본 평가와 별도로 **사전 동작 점검 10회**만 수행한다. 이전 402회 설계에서
+본 평가와 중복되는 반복을 줄여, 별도 실행이 **392회 감소**했다.
 
-- task 0/1의 50개 trial 전체를 원본 Baseline raw·어댑터 raw·raw 반복·identity에서 수행: 400회.
-- 첫 task의 앞 2개 trial에서 α=0 hook이 실제 활성 feature를 변경했는지 확인: 2회.
-- 같은 GPU/라이브러리에서 action trace·성공 여부를 **정확히** 비교한다. 불일치 시 중단한다.
-- 본 평가에서도 전체 raw 500회와 identity 500회의 정확한 일치가 먼저 확인되어야 한다.
+- task 0의 trial 0/1을 원본 Baseline raw·어댑터 raw·raw 반복·identity에서 수행: 8회.
+- 같은 2개 trial에서 α=0 hook이 실제 활성 feature를 변경했는지 확인: 2회.
+- 이 두 상태에서 action trace·성공 여부를 **정확히** 비교한다. 불일치 시 중단한다.
+- 이는 첫 task의 짧은 동작 점검일 뿐, task 전환이나 전체 Baseline 동등성을 검증한 것은 아니다.
+- **본 평가의 raw 500회·identity 500회가 전체 상태에서 정확히 일치해야 feature 평가를 시작한다.**
+  이 1,000회는 본 평가 예산에 이미 포함되어 있으므로 추가 비용이 아니다.
 
 과거 RTX4090 로그 기준, 합집합이 8개라면 행동 평가만 대략 60시간 수준의 계획이다.
 사전 검증·점수 계산·다운로드·재시도는 별도다. **현재 코드의 실제 GPU 소요 시간은 아직 측정하지 않았다.**
 고성능 GPU여도 simulator/CPU 병목 때문에 가격에 비례해 빨라진다고 가정하면 안 된다.
 한 번에 전체 비용을 승인하지 말고, 점수 계산 후 정확한 계획과 사전 검증 결과를 먼저 확인한다.
 
-> 이것이 검증하는 것은 **이번 실행의 Baseline 원본과 어댑터의 일치**다.
+> 사전 점검은 **첫 task의 두 상태에서 Baseline 원본과 어댑터의 일치**를 확인한다.
+> 이후 전체 500개에서 검증하는 것은 **본 실행의 raw와 identity 일치**다.
 > 다른 GPU·라이브러리로 수행한 과거 팀원 성공률과 숫자까지 같아진다는 보장은 아니다.
 > 팀원이 실제 사용한 Baseline commit/backend가 아래 고정값과 다르면 먼저 합의해야 한다.
 
@@ -166,7 +170,7 @@ printf 'PLAN_HASH=%s\nCODE_REV=%s\n' "$PLAN_HASH" "$CODE_REV"
 **각 Top-5·합집합 수·`total_rollouts`를 확인한 다음 진행한다.** 이미 알고 있는 feature를 임의로 빼지 않는다.
 계획 파일을 직접 수정하거나 결과를 보고 후보를 교체하면 안 된다.
 
-## 7. GPU 사전 검증 — 별도 402회
+## 7. GPU 사전 동작 점검 — 별도 10회
 
 먼저 비용 없는 미리보기:
 
@@ -180,11 +184,13 @@ python "$CLI" preflight --plan "$R/plan.json" \
 ```bash
 python -u "$CLI" preflight --plan "$R/plan.json" \
   --output-root "$R/preflight" --baseline-root "$B" \
-  --execute --max-rollouts 402 --approved-plan-hash "$PLAN_HASH" \
+  --execute --max-rollouts 10 --approved-plan-hash "$PLAN_HASH" \
   --expected-code-revision "$CODE_REV" 2>&1 | tee "$R/preflight.log"
 ```
 
 `status: passed`와 `$R/preflight/preflight.json`이 생성되어야 한다.
+인증서는 10회 점검 전용 v2이며 전체 task 검증을 의미하지 않는다.
+이전 v1/402회 인증서는 재사용하지 않는다. 이미 예전 코드로 점검한 경우 새 코드에서 새 출력 폴더를 쓴다.
 불일치 시 허용 오차를 늘려 통과시키지 않는다. 실패 원인과 `child.stdout.log`부터 확인한다.
 새 GPU·패키지 변경·코드 변경 후에는 이전 인증서를 재사용하지 않는다.
 
@@ -297,7 +303,7 @@ python "$CHECK/source/scripts/openvla/headteam500.py" status \
 ## 구현과 아직 검증하지 않은 항목
 
 - 기존 HeadRank 실행기나 Baseline 소스는 변경하지 않았다. 이번 전용 코드·CLI·출력 경로로 분리했다.
-- 로컬 전체 회귀 테스트 1,028개(이번 전용 테스트 100개 포함)를 통과했다.
-  모두 CPU·모의 실행 검증이며, 실제 GPU·LIBERO의 402회 사전 검증은 아직 하지 않았다.
+- 로컬 CPU·모의 실행 회귀 테스트를 수행했다. 실제 GPU·LIBERO의 10회 사전 점검과
+  본 평가 raw/identity 각 500회 검증은 아직 하지 않았다.
 - 기존 layer31 post-MLP residual hook을 모든 token·action step에 적용한다.
 - 중단 시 case 단위로 재개하지 않는다. seed뿐 아니라 RNG·환경의 실행 이력도 맞추기 위해 조건 처음부터 재시작한다.

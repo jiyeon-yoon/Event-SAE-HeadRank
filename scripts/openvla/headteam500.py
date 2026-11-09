@@ -56,7 +56,7 @@ def main(argv=None):
         opt.add_argument("--approved-plan-hash")
         opt.add_argument("--expected-code-revision")
         if command == "preflight":
-            opt.add_argument("--max-rollouts", type=int, default=402)
+            opt.add_argument("--max-rollouts", type=int, default=10)
         else:
             opt.add_argument("--preflight", required=True)
             opt.add_argument("--max-new-conditions", type=int)

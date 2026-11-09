@@ -83,24 +83,47 @@ def run(fixture, **kwargs):
 def test_preview_has_no_backend_or_writes(run_fixture, monkeypatch):
     monkeypatch.setattr(ex, "_native_call", lambda *a, **k: pytest.fail("must not execute"))
     value = ex.preflight(run_fixture["plan_path"], run_fixture["preflight_root"], run_fixture["baseline_root"])
-    assert value["preflight_rollouts"] == 402
+    assert value["preflight_rollouts"] == 10
     assert not run_fixture["preflight_root"].exists()
     value = ex.run_experiment(run_fixture["plan_path"], run_fixture["output_root"], run_fixture["baseline_root"])
     assert value["total_rollouts"] == 4000 and not run_fixture["output_root"].exists()
 
 
-def test_mocked_preflight_uses_two_complete_tasks_and_no_scattered_pilot(run_fixture, monkeypatch):
+def test_mocked_preflight_uses_final_plan_first_two_cases_only(run_fixture, monkeypatch):
     calls = []
     def call(config, condition, cases, *args, **kwargs):
         calls.append((deepcopy(cases), condition["mode"], kwargs.get("reference", False)))
         return mock_receipt(config, condition, cases, *args, **kwargs)
     monkeypatch.setattr(ex, "_native_call", call)
     certificate = json.load(open(certify(run_fixture)))
-    assert certificate["completed_rollouts"] == 402
-    assert [len(c[0]) for c in calls] == [100, 100, 100, 100, 2]
-    assert [(r["task_id"], r["task_episode_idx"]) for r in calls[0][0]] == [
-        (task, trial) for task in (0, 1) for trial in range(50)]
+    assert certificate["schema_version"] == "team500_preflight_v2"
+    assert certificate["completed_rollouts"] == certificate["max_rollouts"] == 10
+    assert [len(c[0]) for c in calls] == [2, 2, 2, 2, 2]
+    assert [(r["task_id"], r["task_episode_idx"]) for r in calls[0][0]] == [(0, 0), (0, 1)]
+    assert all(c[0] == run_fixture["plan"]["cases"][:2] for c in calls)
     assert calls[0][2] is True and all(c[2] is False for c in calls[1:])
+
+
+def test_old_402_budget_is_rejected_before_native_work(run_fixture, monkeypatch):
+    monkeypatch.setattr(ex, "_native_call", lambda *a, **k: pytest.fail("old budget must not execute"))
+    with pytest.raises(ValueError, match="budget"):
+        ex.preflight(run_fixture["plan_path"], run_fixture["preflight_root"],
+                     run_fixture["baseline_root"], max_rollouts=402, **approve(run_fixture))
+    assert not run_fixture["preflight_root"].exists()
+
+
+def test_old_v1_402_certificate_cannot_authorize_new_execution(run_fixture, monkeypatch):
+    old = json.load(open(certify(run_fixture)))
+    old.update(schema_version="team500_preflight_v1", completed_rollouts=402, max_rollouts=402,
+               prefix_manifest_hash=fingerprint(run_fixture["plan"]["cases"][:100]))
+    old["preflight_hash"] = fingerprint({k: v for k, v in old.items() if k != "preflight_hash"})
+    path = run_fixture["preflight_root"] / "old-certificate.json"
+    atomic_write_json(path, old)
+    monkeypatch.setattr(ex, "_native_call", lambda *a, **k: pytest.fail("old certificate must not execute"))
+    with pytest.raises(ValueError, match="Preflight is missing, stale"):
+        ex.run_experiment(run_fixture["plan_path"], run_fixture["output_root"],
+            run_fixture["baseline_root"], preflight_path=path, **approve(run_fixture))
+    assert not run_fixture["output_root"].exists()
 
 
 def test_exact_actions_not_just_success_rate_gate(run_fixture, monkeypatch):
@@ -140,6 +163,22 @@ def test_no_feature_before_full_raw_identity_gate_and_safe_pause(run_fixture, mo
     assert done["status"] == "completed" and done["completed_rollouts"] == 4000
     assert calls == [c["condition_id"] for c in run_fixture["plan"]["conditions"]]
     assert ex.status(run_fixture["plan_path"], run_fixture["output_root"])["pending_rollouts"] == 0
+
+
+def test_small_preflight_never_substitutes_for_full500_raw_controls(run_fixture, monkeypatch):
+    certify(run_fixture)
+    calls = []
+    def partial(config, condition, cases, *args, **kwargs):
+        calls.append((condition["condition_id"], len(cases)))
+        receipt = mock_receipt(config, condition, cases, *args, **kwargs)
+        receipt["episodes"] = receipt["episodes"][:2]
+        return receipt
+    monkeypatch.setattr(ex, "_native_call", partial)
+    with pytest.raises(ValueError, match="episode count"):
+        run(run_fixture)
+    assert calls == [("raw", 500)]
+    state = ex.status(run_fixture["plan_path"], run_fixture["output_root"])
+    assert state["completed_conditions"] == 0 and state["completed_rollouts"] == 0
 
 
 def test_failed_identity_cannot_launch_feature_or_count_task_failure(run_fixture, monkeypatch):

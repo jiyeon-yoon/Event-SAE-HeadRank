@@ -3,7 +3,7 @@
 One native call executes a whole ordered condition.  A partially completed
 condition is never resumed by skipping cases: its global RNG/environment
 history must be replayed from the beginning.  GPU work is opt-in and requires
-both an approved plan hash and a successful, source-bound conformance check.
+both an approved plan hash and a successful, source-bound prefix smoke check.
 """
 from __future__ import annotations
 
@@ -21,8 +21,9 @@ from event_sae.research.output_head.provenance import (
 )
 
 REPO = Path(__file__).resolve().parents[3]
-PREFLIGHT_CASES = 100  # First two complete tasks, preserving the stock loop.
+PREFLIGHT_CASES = 2  # Only task0 trials 0/1; main raw/identity cover all 500.
 PREFLIGHT_ROLLOUTS = 4 * PREFLIGHT_CASES + 2
+PREFLIGHT_SCOPE = "first_task_two_case_prefix_smoke_not_full_suite_conformance"
 
 
 def _signed(payload, field):
@@ -237,27 +238,30 @@ def _suppression_proof(receipt):
 def preflight(plan_path, output_root, baseline_root, runtime_config_path=None, *,
               execute=False, approved_plan_hash=None, expected_code_revision=None,
               max_rollouts=PREFLIGHT_ROLLOUTS, scores_path=None):
-    """Run 402 explicitly authorized conformance episodes, not a random pilot.
+    """Run ten explicitly authorized prefix smoke episodes, not a random pilot.
 
-    The first 100 cases are complete task blocks 0/1 with 50 trials each. This
-    tests a task boundary without changing the stock uniform trial loop. The
-    alpha-zero hook smoke test uses the first two cases of the final plan.
+    Each call uses only task0 trials 0/1, a legal prefix of the stock loop.
+    Four raw/reference/repeat/identity conditions plus one alpha-zero check
+    cost ten episodes. This does not test task transitions or establish full
+    suite Baseline conformance. The separate main raw/identity gate still
+    compares all 500 cases before any feature evaluation is permitted.
     """
     plan = _load_plan(plan_path, scores_path)
     config = _runtime_config(plan, runtime_config_path)
     if not execute:
         return {"status": "not_executed", "plan_hash": plan["plan_hash"],
                 "preflight_rollouts": PREFLIGHT_ROLLOUTS, "model_execution": False,
+                "claim_scope": PREFLIGHT_SCOPE,
                 "required": "--execute --approved-plan-hash HASH --expected-code-revision COMMIT"}
     if type(max_rollouts) is not int or max_rollouts != PREFLIGHT_ROLLOUTS:
-        raise ValueError("Conformance preflight requires the exact explicit 402-rollout budget")
+        raise ValueError("Prefix smoke preflight requires the exact explicit 10-rollout budget")
     code = _approval(plan, approved_plan_hash, expected_code_revision)
     root = _root(output_root, [plan_path, runtime_config_path, baseline_root, REPO,
                               *_config_inputs(config)])
     cases = plan["cases"][:PREFLIGHT_CASES]
-    expected = [(task, trial) for task in (0, 1) for trial in range(50)]
+    expected = [(0, trial) for trial in range(PREFLIGHT_CASES)]
     if [(c["task_id"], c["task_episode_idx"]) for c in cases] != expected:
-        raise ValueError("Preflight must be the first two full task blocks of the final plan")
+        raise ValueError("Smoke preflight must use task0 trials 0/1 in the final plan order")
     raw = next(c for c in plan["conditions"] if c["mode"] == "raw")
     identity = next(c for c in plan["conditions"] if c["mode"] == "identity")
     smoke = next(c for c in plan["conditions"] if c["mode"] == "intervention"
@@ -265,10 +269,11 @@ def preflight(plan_path, output_root, baseline_root, runtime_config_path=None, *
     with _lock(root):
         if any(p.name != ".execution.lock" for p in root.iterdir()):
             raise FileExistsError("Preflight requires a fresh evidence directory")
-        binding = {"schema_version": "team500_preflight_binding_v1",
+        binding = {"schema_version": "team500_preflight_binding_v2",
                    "plan_hash": plan["plan_hash"], "runtime_config_hash": fingerprint(config),
                    "code_identity": code, "case_manifest_hash": fingerprint(plan["cases"]),
-                   "prefix_manifest_hash": fingerprint(cases), "max_rollouts": max_rollouts}
+                   "prefix_manifest_hash": fingerprint(cases), "max_rollouts": max_rollouts,
+                   "preflight_scope": PREFLIGHT_SCOPE}
         _write_once(root / "binding.json", binding)
         receipts = {}
         runtime = None
@@ -302,21 +307,21 @@ def preflight(plan_path, output_root, baseline_root, runtime_config_path=None, *
         }
         if _code_identity() != code:
             raise ValueError("Implementation changed during preflight")
-        certificate = _signed({**binding, "schema_version": "team500_preflight_v1",
+        certificate = _signed({**binding, "schema_version": "team500_preflight_v2",
             "status": "passed", "synthetic": False, "runtime_identity": runtime,
             "checks": checks, "completed_rollouts": PREFLIGHT_ROLLOUTS,
             "receipt_hashes": {key: value["receipt_hash"] for key, value in receipts.items()},
-            "claim_scope": "same-runtime stock-Baseline versus adapter prefix conformance; not historical cross-GPU parity"},
+            "claim_scope": PREFLIGHT_SCOPE},
             "preflight_hash")
         _write_once(root / "preflight.json", certificate)
     return {"status": "passed", "preflight": str(root / "preflight.json"),
             "preflight_hash": certificate["preflight_hash"], "model_execution": True,
-            "completed_rollouts": PREFLIGHT_ROLLOUTS}
+            "completed_rollouts": PREFLIGHT_ROLLOUTS, "claim_scope": PREFLIGHT_SCOPE}
 
 
 def _certificate(path, plan, config, code):
     certificate = _read_signed(path, "preflight_hash")
-    if (certificate.get("schema_version") != "team500_preflight_v1"
+    if (certificate.get("schema_version") != "team500_preflight_v2"
             or certificate.get("status") != "passed" or certificate.get("synthetic") is not False
             or certificate.get("plan_hash") != plan["plan_hash"]
             or certificate.get("runtime_config_hash") != fingerprint(config)
@@ -324,6 +329,8 @@ def _certificate(path, plan, config, code):
             or certificate.get("prefix_manifest_hash") != fingerprint(plan["cases"][:PREFLIGHT_CASES])
             or certificate.get("completed_rollouts") != PREFLIGHT_ROLLOUTS
             or certificate.get("max_rollouts") != PREFLIGHT_ROLLOUTS
+            or certificate.get("preflight_scope") != PREFLIGHT_SCOPE
+            or certificate.get("claim_scope") != PREFLIGHT_SCOPE
             or certificate.get("code_identity") != code):
         raise ValueError("Preflight is missing, stale, synthetic or bound to a different experiment")
     directory = Path(path).resolve().parent
@@ -430,6 +437,8 @@ def run_experiment(plan_path, output_root, baseline_root, *, runtime_config_path
         return {"status": "not_executed", "plan_hash": plan["plan_hash"],
                 "total_rollouts": plan["total_rollouts"], "conditions": len(plan["conditions"]),
                 "model_execution": False, "preflight_required": True,
+                "preflight_rollouts": PREFLIGHT_ROLLOUTS,
+                "full_controls_included_rollouts": 1000,
                 "required": "--execute --approved-plan-hash HASH --expected-code-revision COMMIT --preflight FILE"}
     code = _approval(plan, approved_plan_hash, expected_code_revision)
     if preflight_path is None:
