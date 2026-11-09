@@ -1,5 +1,22 @@
 # Event-SAE HeadRank
 
+## 2026-11-09 — 팀 Baseline 조건에 맞춘 500개·Top-5 재평가
+
+새 브랜치 `research/team-baseline-500-top5`의 실행 안내는
+**[새 RunPod 실행 문서](docs/run_team500.md)**에 모았다.
+Mean Head-KL·Tail Head-KL·Event-max를 기존 500개 episode에서 산출하고,
+각 Top-5의 합집합을 같은 500개 초기 상태에서 평가한다. 기존 22개 feature는 제외하지 않는다.
+
+행동 평가는 별도 체크아웃한 고정 버전의 **팀 Baseline 원본**을 호출한다.
+조건 시작 시 global seed=0, task마다 환경 생성·seed=0, trial 순서 유지,
+episode별 재설정 없음이 기준이다. 실제 GPU에서는 402회 사전 검증과
+본 평가의 raw/identity 일치를 확인해야 한다. **로컬 테스트만으로 GPU 일치를 확인한 것은 아니다.**
+선정·평가에 같은 500개를 쓰므로, 미평가 데이터에 대한 일반화 실험이 아니라 조건 정렬을 위한 재평가다.
+
+---
+
+## 기존 연구·진단 기록 — 아래 내용은 보존
+
 기존 실험을 보존하면서 **출력층 민감도로 아직 행동 평가하지 않은 SAE feature의
 중요도 순위**를 예측하는 후속 개발 저장소다. `headrank.py`는 비학습 순위 실험이고,
 `headpredict.py`는 별도의 **개발용 성공률 하락 보정 예측기**다. 두 결과를 혼동하지 않는다.
